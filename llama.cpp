@@ -629,7 +629,7 @@ enum tensor_offloading_levels {
     TENSOR_OFFLOAD_KV_CACHE,
 };
 
-tensor_offloading_levels get_offloading_level(llm_tensor tensor) {
+static tensor_offloading_levels get_offloading_level(llm_tensor tensor) {
     switch (tensor) {
         case LLM_TENSOR_TOKEN_EMBD: case LLM_TENSOR_TOKEN_EMBD_NORM: case LLM_TENSOR_POS_EMBD: 
         case LLM_TENSOR_ROPE_FREQS:
@@ -2726,6 +2726,7 @@ static int64_t sum_gpu_index(struct ggml_tensor * gpu_index) {
     ggml_context * ctx_aux = ggml_init({
         /* mem_size */ 1 << 10,
         /* mem_buffer */ nullptr,
+        /* no alloc*/ false,
     });
 
     GGML_ASSERT(ctx_aux);
@@ -2810,6 +2811,8 @@ struct llama_gpu_split_loader {
         }
         llama_progress_callback cb = [](float progress, void *ctx) {
             LLAMA_LOG_INFO(".");
+            GGML_UNUSED(progress);
+            GGML_UNUSED(ctx);
         };
         idx_loader->load_all_data(ctx_meta, cb, nullptr, nullptr);
 
@@ -2938,6 +2941,7 @@ struct llama_augmentation_model_loader {
         layer.ffn_down_gpu = create_striped_mat_to_gpu(layer.ffn_down_t, gpu_bucket);
         offloaded_bytes += ggml_nbytes(layer.ffn_down_gpu);
 
+        GGML_UNUSED(gpu_idx);
         return offloaded_bytes;
     }
 
@@ -3190,6 +3194,9 @@ static void llm_load_sparse_model_tensors(
         llama_backend_offload_split = GGML_BACKEND_GPU;
 #endif
 
+    GGML_UNUSED(llama_backend_offload);
+    GGML_UNUSED(llama_backend_offload_split);
+
     buffered_tensor_allocator alloc(ml, ctx, hparams);
     uint32_t current_layer = 0;
     auto create_tensor = [&alloc, &current_layer] (
@@ -3327,7 +3334,7 @@ void llama_reserve_model_kv_cache(llama_model *model, const llama_context_params
     }
 
     const llama_hparams &hparams = model->hparams;
-    if (model->n_gpu_layers < hparams.n_layer + 1) {
+    if (static_cast<uint32_t>(model->n_gpu_layers) < hparams.n_layer + 1) {
         // should only reserve kv cache for models with all layers offloaded
         return;
     }
@@ -4270,6 +4277,7 @@ static std::pair<ggml_tensor*, ggml_tensor*> llm_build_kv_store(
     //ggml_build_forward_expand(graph, ggml_cpy(ctx, k_cur,   k_cache_view));
     //ggml_build_forward_expand(graph, ggml_cpy(ctx, v_cur_t, v_cache_view));
     
+    GGML_UNUSED(graph);
     return {k_cpy, v_cpy};
 }
 
@@ -4398,7 +4406,7 @@ static struct ggml_tensor * llm_build_ffn(
 
     return cur;
 }
-void print_shape(struct ggml_tensor * a, std::string const & str) {
+static void print_shape(struct ggml_tensor * a, std::string const & str) {
     auto ptr_ne{a->ne};
     auto ptr_nb{a->nb};
     printf("%s : %ld, %ld, %ld, %ld, %ld, %ld, %ld, %ld, %d\n", 
@@ -4587,9 +4595,7 @@ static struct ggml_tensor * llm_build_ffn_sparse_new(
 
     bool full_gpu = gpu_offload_ratio >= 1.0;
     bool up_relu = (type_gate == LLM_FFN_SYM);
-    // printf("up is %d\n", up_relu);
 
-    ggml_tensor * ffn_input = cur;
     llm_build_cb_short cb = [&cb_outer](struct ggml_tensor * tensor, const char * name) {
         cb_outer(tensor, name);
 #if defined(GGML_USE_CUBLAS)
@@ -9585,6 +9591,8 @@ struct llama_model_params llama_model_default_params() {
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_mlock                   =*/ false,
+        /*.reset_gpu_index*/ false,
+        /*.disable_gpu_index*/ false,
     };
 
 #ifdef GGML_USE_METAL

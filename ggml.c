@@ -1611,6 +1611,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT",
     "MUL_MAT_SPARSE",
+    "FFN_FUSION",
     "AXPY",
     "OUT_PROD",
 
