@@ -2110,6 +2110,7 @@ struct llama_model_loader {
     }
 
     void load_all_data(struct ggml_context * ctx, llama_progress_callback progress_callback, void * progress_callback_user_data, llama_mlock * lmlock) {
+        printf("here3\n");
         size_t size_data = 0;
         size_t size_lock = 0;
         size_t size_pref = 0; // prefetch
@@ -2160,15 +2161,18 @@ struct llama_model_loader {
 #ifdef GGML_USE_CUBLAS
                 case GGML_BACKEND_GPU:
                 case GGML_BACKEND_GPU_SPLIT:
+                {
                     // old code:
                     //ggml_cuda_transform_tensor(lt.data, lt.ggml_tensor);
-
+                    char *buffer = new char[ggml_nbytes(cur)];
+                    memcpy(buffer, cur->data, ggml_nbytes(cur));
                     // TODO: test if this works !!
-                    ggml_cuda_transform_tensor(cur->data, cur);
+                    ggml_cuda_transform_tensor(buffer, cur);
+                    delete[] buffer;
                     if (!use_mmap) {
                         free(cur->data);
                     }
-                    break;
+                } break;
 #elif defined(GGML_USE_CLBLAST)
                 case GGML_BACKEND_GPU:
                     ggml_cl_transform_tensor(cur->data, cur);
@@ -2721,6 +2725,7 @@ static void llm_load_print_meta(llama_model_loader & ml, llama_model & model) {
 static int64_t sum_gpu_index(struct ggml_tensor * gpu_index) {
     ggml_context * ctx_aux = ggml_init({
         /* mem_size */ 1 << 10,
+        /* mem_buffer */ nullptr,
     });
 
     GGML_ASSERT(ctx_aux);
@@ -2782,6 +2787,7 @@ struct llama_gpu_split_loader {
     }
 
     int load_gpu_idx_for_model(llama_model * model) {
+        printf("here1\n");
         int n_layers = model->layers.size();
         // TODO: assert fp is at the end of headers
         if (n_tensors != n_layers * 2) {
@@ -2860,11 +2866,16 @@ struct llama_augmentation_model_loader {
 
         // allocate and copy selected weights to gpu
     ggml_tensor * create_striped_mat_to_gpu(struct ggml_tensor *src, struct ggml_tensor * gpu_bucket) {
+        // printf("here\n");
 #ifdef GGML_USE_CUBLAS
         if (gpu_bucket == NULL) {
             // offload the whole tensor to gpu
             ggml_set_backend(src, GGML_BACKEND_GPU);
-            ggml_cuda_transform_tensor(src->data, src);
+            auto size_src = ggml_nbytes(src);
+            char * buffer = new char[size_src];
+            memcpy(buffer, src->data, size_src);
+            ggml_cuda_transform_tensor(buffer, src);
+            delete[] buffer;
             return src;
         }
 
@@ -4387,6 +4398,13 @@ static struct ggml_tensor * llm_build_ffn(
 
     return cur;
 }
+void print_shape(struct ggml_tensor * a, std::string const & str) {
+    auto ptr_ne{a->ne};
+    auto ptr_nb{a->nb};
+    printf("%s : %ld, %ld, %ld, %ld, %ld, %ld, %ld, %ld, %d\n", 
+        str.c_str(), ptr_ne[0], ptr_ne[1], ptr_ne[2], ptr_ne[3], 
+        ptr_nb[0], ptr_nb[1], ptr_nb[2], ptr_nb[3], a->backend);
+}
 
 static struct ggml_tensor * llm_build_sparse_mul_mat(
         struct ggml_context * ctx,
@@ -4494,6 +4512,136 @@ static struct ggml_tensor * llm_build_sparse_axpy(
     return out;
 }
 
+// #define GGML_USE_CUBLAS // !
+#ifdef GGML_USE_CUBLAS
+static struct ggml_tensor * llm_build_ffn_sparse_new_for_cuda(
+    struct ggml_context * ctx,
+    struct ggml_tensor * cur,
+    struct ggml_tensor * up_gpu,
+    struct ggml_tensor * gate_gpu,
+    struct ggml_tensor * down_gpu,
+    struct ggml_tensor * sparse_index,
+    // struct ggml_tensor * gpu_index,
+    struct ggml_tensor * gpu_bucket,
+    bool full_gpu,
+    bool up_relu
+    // ,
+) {
+    ggml_tensor * out = nullptr;
+    if (full_gpu) {
+        out = ggml_ffn_fusion(ctx, cur, up_gpu, gate_gpu, down_gpu, sparse_index, NULL, NULL, up_relu);
+    } else {
+        GGML_ASSERT(gpu_bucket);
+        out = ggml_ffn_fusion(ctx, cur, up_gpu, gate_gpu, down_gpu, sparse_index, NULL, gpu_bucket, up_relu);
+    }
+    return out;
+}
+#endif
+// #undef GGML_USE_CUBLAS // !
+
+static struct ggml_tensor * llm_build_ffn_sprase_new_cpu(
+    struct ggml_context * ctx,
+    struct ggml_tensor * cur,
+    struct ggml_tensor * up_cpu,
+    struct ggml_tensor * gate_cpu,
+    struct ggml_tensor * down_cpu,
+    struct ggml_tensor * sparse_idx,
+    struct ggml_tensor * gpu_index,
+    bool up_relu
+    // ,
+) {
+    ggml_tensor * out = nullptr;
+    out = ggml_ffn_fusion(ctx, cur, up_cpu, gate_cpu, down_cpu, sparse_idx, gpu_index, NULL, up_relu);
+    return out;
+}
+
+static struct ggml_tensor * llm_build_ffn_sparse_new(
+    struct ggml_context * ctx,
+    struct ggml_tensor * cur,
+    struct ggml_tensor * up,
+    struct ggml_tensor * up_b, 
+    struct ggml_tensor * gate,
+    struct ggml_tensor * gate_b,
+    struct ggml_tensor * down_t,
+    struct ggml_tensor * down_b,
+    struct ggml_tensor * pre_w1, // ?
+    struct ggml_tensor * pre_w2, // ?
+    struct ggml_tensor * pred_inpl, // ? 
+    struct ggml_tensor * gpu_index, // 表示哪些在GPU上
+    struct ggml_tensor * gpu_bucket, // 表示GPU对应的索引
+    struct ggml_tensor * gate_gpu,
+    struct ggml_tensor * down_gpu,
+    struct ggml_tensor * up_gpu,
+    llm_ffn_op_type   type_op,
+    llm_ffn_gate_type   type_gate,
+    double   gpu_offload_ratio,
+    const llm_build_cb_short & cb_outer
+) {
+    GGML_ASSERT(gate and "model needs gate");
+    GGML_ASSERT((type_op == LLM_FFN_RELU) and "unsupported act type");
+    GGML_ASSERT((type_gate == LLM_FFN_PAR or type_gate == LLM_FFN_SYM) and "unsupported act gate type");
+
+    if (!(up_b == nullptr && gate_b == nullptr && down_b == nullptr)) {
+        abort();
+    }
+
+    bool full_gpu = gpu_offload_ratio >= 1.0;
+    bool up_relu = (type_gate == LLM_FFN_SYM);
+    // printf("up is %d\n", up_relu);
+
+    ggml_tensor * ffn_input = cur;
+    llm_build_cb_short cb = [&cb_outer](struct ggml_tensor * tensor, const char * name) {
+        cb_outer(tensor, name);
+#if defined(GGML_USE_CUBLAS)
+        // Determine offloading based on src[0] (weight for both mul and axpy)
+        bool operates_on_gpu = tensor->src[0]->backend == GGML_BACKEND_GPU;
+        if (operates_on_gpu) {
+            ggml_cuda_assign_buffers_no_alloc(tensor);
+        }
+#endif
+    };
+
+    ggml_tensor * out = nullptr;
+
+    ggml_tensor * idx = ggml_mul_mat(ctx, pre_w1, pred_inpl);
+    cb(idx, "mlp_pre_hidden");
+    idx = ggml_relu(ctx, idx);
+    cb(idx, "mlp_pre_relu");
+    idx = ggml_mul_mat(ctx, pre_w2, idx);
+    (full_gpu ? cb : cb_outer)(idx, "mlp_pre_out");
+
+    std::string ffn_name = "ffn_sparse_fusion";
+#ifdef GGML_USE_CUBLAS
+    if (full_gpu) {
+        // printf("build full gpu here\n");
+        GGML_ASSERT(up_gpu);
+        out = llm_build_ffn_sparse_new_for_cuda(
+            ctx, cur, up_gpu, gate_gpu, down_gpu, idx, gpu_bucket, true, up_relu
+        );
+        ggml_cuda_assign_buffers_no_alloc(out);
+        cb(out, (ffn_name + "_full_on_gpu").c_str());
+        return out;
+    }
+#endif
+
+    out = llm_build_ffn_sprase_new_cpu(
+        ctx, cur, up, gate, down_t, idx, gpu_index, up_relu
+    );
+    cb(out, (ffn_name + "_cpu").c_str());
+
+#ifdef GGML_USE_CUBLAS
+    if (up_gpu) {
+        ggml_tensor * out_gpu = llm_build_ffn_sparse_new_for_cuda(
+            ctx, cur, up_gpu, gate_gpu, down_gpu, idx, gpu_bucket, false, up_relu
+        );
+        cb(out_gpu, (ffn_name + "_gpu").c_str());
+        out = ggml_add(ctx, out, out_gpu);
+        cb(out, (ffn_name + "_merge").c_str());
+    }
+#endif
+    return out;
+}
+
 static struct ggml_tensor * llm_build_ffn_sparse(
         struct ggml_context * ctx,
          struct ggml_tensor * cur,
@@ -4515,6 +4663,14 @@ static struct ggml_tensor * llm_build_ffn_sparse(
           llm_ffn_gate_type   type_gate,
                      double   gpu_offload_ratio,
    const llm_build_cb_short & cb_outer) {
+
+    // ! patch jump to fusion
+    if (cur->ne[1] == 1) {
+        auto out = llm_build_ffn_sparse_new(ctx, cur, up, up_b, gate, gate_b, down_t, down_b, pre_w1, pre_w2,  pred_inpl,
+            gpu_index, gpu_bucket, gate_gpu, down_gpu, up_gpu, type_op, type_gate, gpu_offload_ratio, cb_outer);
+        return out;
+    }
+
     bool full_gpu = gpu_offload_ratio >= 1.0;
     ggml_tensor * ffn_input = cur;
 
@@ -4528,7 +4684,12 @@ static struct ggml_tensor * llm_build_ffn_sparse(
         }
 #endif
     };
-
+    // print_shape(cur, "input");
+    // print_shape(up, "up");
+    // print_shape(up_gpu, "up_gpu");
+    // print_shape(gate, "gate");
+    // print_shape(gate_gpu, "gate_gpu");
+    // print_shape(down_t, "down");
     // prepare sparse idx
     ggml_tensor * idx = ggml_mul_mat(ctx, pre_w1, pred_inpl);
     cb(idx, "mlp_pre_hidden");
@@ -4538,6 +4699,10 @@ static struct ggml_tensor * llm_build_ffn_sparse(
     // If the FFN layer is not fully offloaded, we need to transfer the sparsity index
     // back to the CPU to avoid synchronization issues.
     (full_gpu ? cb : cb_outer)(idx, "mlp_pre_out");
+    // print_shape(pre_w1, "pre1");
+    // print_shape(idx, "idx");
+    // print_shape(gpu_index, "gpu_index");
+    // print_shape(gpu_bucket, "gpu_budget");
 
     auto act_fn = [&](ggml_tensor * tensor, const char * name) {
         switch (type_op) {
@@ -4696,6 +4861,7 @@ static struct ggml_tensor * llm_build_kqv(
 
 const llm_build_cb no_offload_cb = [](struct ggml_tensor * cur, const char * name, int nl) {
     ggml_set_name(cur, name);
+    GGML_UNUSED(nl);
 };
 
 struct llm_build_context {
@@ -6618,7 +6784,7 @@ static int llama_decode_internal(
         model.arch == LLM_ARCH_STARCODER  ||
         model.arch == LLM_ARCH_STABLELM   ||
         model.arch == LLM_ARCH_BAMBOO;
-
+    GGML_UNUSED(full_offload_supported);
     // const bool fully_offloaded = model.n_gpu_layers >= (int) hparams.n_layer + 3;
     // if (ggml_cpu_has_cublas() && full_offload_supported && fully_offloaded) {
     //     n_threads = 8;
@@ -6660,7 +6826,9 @@ static int llama_decode_internal(
             kv_self.head = 0;
         }
     }
-
+// #ifndef GGML_PERF
+// #define GGML_PERF
+// #endif
 #ifdef GGML_PERF
     // print timing information per ggml operation (for debugging purposes)
     // requires GGML_PERF to be defined

@@ -4413,6 +4413,27 @@ static __global__ void dequantize_mul_mat_vec(const void * __restrict__ vx, cons
     }
 }
 
+template <ggml_type type>
+struct ggml_cuda_type_traits;
+
+template <>
+struct ggml_cuda_type_traits<GGML_TYPE_F16> {
+    static constexpr int qk = 1;
+    static constexpr int qr = 1;
+};
+
+template <>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0> {
+    static constexpr int qk = QK4_0;
+    static constexpr int qr = QR4_0;
+    static constexpr int qi = QI4_0;
+};
+
+inline static constexpr __device__ dequantize_kernel_t get_deq_kernel(ggml_type type) {
+    return type == GGML_TYPE_F16 ? static_cast<dequantize_kernel_t>(convert_f16):
+        type == GGML_TYPE_Q4_0 ? static_cast<dequantize_kernel_t>(dequantize_q4_0) :
+        nullptr;
+}
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
 static __global__ void dequantize_mul_mat_axpy(const void * __restrict__ vx, const dfloat * __restrict__ y, float * __restrict__ dst, const int ncols, const int nrows) {
@@ -4681,6 +4702,124 @@ static __global__ void dequantize_mul_mat_axpy_sparse_batch(const void * __restr
     }
 }
 
+template <bool Up_relu, ggml_type T_type, dequantize_kernel_t dequantize_kernel = convert_f16, bool Full_offload = true>
+__global__ void ffn_all_gpu_vec(
+    float const * __restrict__ cur_data,
+    int const n_rows, // gpu上的行數 11008
+    int const n_cols, // 列數 4096
+    void const * __restrict__ up_data,
+    void const * __restrict__ gate_data,
+    void const * __restrict__ down_data,
+    float const * __restrict__ sparse_idx_data,
+    int const * __restrict__ gpu_index_data,
+    float * __restrict__ dst_data
+    , float * __restrict__ tmp_up_val = nullptr
+    , float * __restrict__ tmp_gate_val = nullptr
+) {
+    constexpr int qk = 1;
+    constexpr int qr = 1;
+
+    const int gpu_row = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (gpu_row >= n_rows) {
+        return;
+    }
+
+    int row = Full_offload ? gpu_row : gpu_index_data[gpu_row];
+    if (sparse_idx_data[row] < dev_sparse_threshold) {
+        return;
+    }
+
+    const int tid = threadIdx.x;
+
+    const int iter_stride = 2 * GGML_CUDA_DMMV_X;
+    const int vals_per_iter = iter_stride / WARP_SIZE; // num quantized vals per thread and i iter
+    const int y_offset = qr == 1 ? 1 : qk/2;
+
+    float tmp = 0.0f, tmp1 = 0.0f;
+
+
+    for (int i = 0; i < n_cols; i += iter_stride) {
+        const int col = i + vals_per_iter * tid;
+        const int ib = (gpu_row * n_cols + col) / qk; // x block index
+        const int iqs = (col % qk)/qr; // x quant index
+        const int iybs = col - col % qk; // y block start index
+
+#pragma unroll
+        for (int j = 0; j < vals_per_iter; j += 2) {
+            float2 v, v1;
+            dequantize_kernel(up_data, ib, iqs + j / qr, v);
+            dequantize_kernel(gate_data, ib, iqs + j / qr, v1);
+            
+
+            tmp += v.x * cur_data[iybs + iqs + j/qr + 0];
+            tmp += v.y * cur_data[iybs + iqs + j/qr + y_offset];
+
+            tmp1 += v1.x * cur_data[iybs + iqs + j/qr + 0];
+            tmp1 += v1.y * cur_data[iybs + iqs + j/qr + y_offset];
+
+            // if (row == 0 && tid == 0) {
+            //     half const * ptr = (half const *)gate_data;
+            //     printf("%f, %f, %f, %f, %f, %f\n", v1.x, v1.y,(float)ptr[ib + iqs + j / qr + 0], (float)ptr[ib + iqs + j / qr + y_offset], 
+            //         cur_data[iybs + iqs + j/qr + 0], cur_data[iybs + iqs + j/qr + y_offset]);
+                
+            // }
+        }
+    }
+
+    // sum up partial sums and write back result
+    float const sum_up = warp_reduce_sum(tmp);
+    float const sum_gate = warp_reduce_sum(tmp1);
+
+    
+    // if (row == 0 && tid == 0) {
+    //     printf("%f, %f\n", sum_up, sum_gate);
+    // }
+
+    if (tmp_up_val != nullptr && tid == 0) {
+        
+        tmp_up_val[row] = sum_up;
+    }
+
+    if (tmp_gate_val != nullptr && tid == 0) {
+        // printf("here\n");
+        tmp_gate_val[row] = sum_gate;
+    }
+
+    if (sum_gate <= 0.0f) {return;}
+
+    if (Up_relu and sum_up <= 0.0f) {return;}
+
+    float const tmp_u_g = sum_up * sum_gate; 
+    // printf("tmpug is %f, gpu %d\n", tmp_u_g, gpu_row);
+
+    for (int i = 0; i < n_cols; i += iter_stride) {
+        const int col   = i + vals_per_iter*tid;
+        const int ib    = (row * n_cols + col) / qk; // x block index
+        const int iqs   = (col % qk) / qr; // x quant index
+        const int iybs  = col - col % qk; // y block start index
+
+        // processing >2 values per i iter is faster for fast GPUs
+        #pragma unroll
+        for (int j = 0; j < vals_per_iter; j += 2) {
+            // process 2 vals per j iter
+
+            // dequantize
+            // for qr = 2 the iqs needs to increase by 1 per j iter because 2 weights per data val
+            float2 v;
+            dequantize_kernel(down_data, ib, iqs + j/qr, v);
+
+            // matrix multiplication
+            // for qr = 2 the y index needs to increase by 1 per j iter because of y_offset = qk/2
+            const int idx_0 = iybs + iqs + j/qr;
+            const int idx_1 = idx_0 + y_offset;
+
+            atomicAdd(&dst_data[idx_0], v.x * tmp_u_g);
+            atomicAdd(&dst_data[idx_1], v.y * tmp_u_g);
+        }
+    }
+}
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
 static __global__ void dequantize_mul_mat_vec_sparse(const void * __restrict__ vx, const dfloat * __restrict__ y, float * __restrict__ dst, const int ncols, const int nrows, int * lst, float * idx) {
     // qk = quantized weights per x block
@@ -4735,6 +4874,12 @@ static __global__ void dequantize_mul_mat_vec_sparse(const void * __restrict__ v
 #else
             tmp += v.x * y[iybs + iqs + j/qr + 0];
             tmp += v.y * y[iybs + iqs + j/qr + y_offset];
+
+            // if (row == 0 && tid == 0) {
+            //     half const * ptr = (half const *) vx;
+            //     printf("%f, %f, %f, %f, %f, %f\n", v.x, v.y,(float)ptr[ib + iqs + j / qr + 0], (float)ptr[ib + iqs + j / qr + y_offset], 
+            //         y[iybs + iqs + j/qr + 0], y[iybs + iqs + j/qr + y_offset]);
+            // }
 #endif // GGML_CUDA_F16
         }
     }
@@ -4744,6 +4889,10 @@ static __global__ void dequantize_mul_mat_vec_sparse(const void * __restrict__ v
     for (int mask = 16; mask > 0; mask >>= 1) {
         tmp += __shfl_xor_sync(0xffffffff, tmp, mask, 32);
     }
+
+    // if (row == 0 && tid == 0) {
+    //     printf("%f\n", tmp);
+    // }
 
     if (tid == 0) {
 #ifdef GGML_CUDA_F16
@@ -6522,7 +6671,7 @@ void ggml_init_cublas() {
 
             // create cublas handle
             CUBLAS_CHECK(cublasCreate(&g_cublas_handles[id]));
-            CUBLAS_CHECK(cublasSetMathMode(g_cublas_handles[id], CUBLAS_TF32_TENSOR_OP_MATH));
+            CUBLAS_CHECK(cublasSetMathMode(g_cublas_handles[id], CUBLAS_TENSOR_OP_MATH));
         }
 
         // configure logging to stdout
@@ -7229,6 +7378,35 @@ inline void ggml_cuda_op_dequantize_mul_mat_vec(
     (void) src1_padded_row_size;
 }
 
+template <ggml_type T_type>
+void print_data_to_file(char const * file_name, char const * tensor_name, char const * data, int const num = 4096) {
+    FILE *file = fopen(file_name, "a+");
+    // if (!file) {
+    //     printf("error!\n");
+    //     exit(1);
+    // }
+    fprintf(file, "%s : ", tensor_name);
+    if constexpr (T_type == GGML_TYPE_F16) {
+        for (int i{0}; i < num; i++) {
+            half a = *((half const *)data);
+            float b = a;
+            fprintf(file, "%f ", b);
+            data += 2;
+        }
+        fprintf(file, "\n");
+    } 
+    if constexpr (T_type == GGML_TYPE_F32) {
+        for (int i{0}; i < num; i++) {
+            float a = *((float const *)data);
+            fprintf(file, "%f ", a);
+            data += 4;
+        }
+        fprintf(file, "\n");
+    }
+
+    fclose(file);
+}
+
 inline void ggml_cuda_op_mul_mat_vec_sparse_q(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
@@ -7291,7 +7469,24 @@ inline void ggml_cuda_op_mul_mat_vec_sparse_dequantized(
 
     float * sparse_idx = static_cast<float *>(ggml_cuda_get_tensor_data(dst->src[2]));
     int32_t * row_lookup = dst->src[3] != NULL ? static_cast<int32_t *>(ggml_cuda_get_tensor_data(dst->src[3])) : NULL;
+    // for (auto i{0}; i < 11008; ++i) {
+    //     printf("%f ", sparse_idx[i]);
+    // }
+    // printf("back is %d\n", dst->src[2]->backend);
+    // cudaPointerAttributes attr;
+    // cudaPointerGetAttributes(&attr, src1->data);
+    // printf("attr type is %d\n", attr.type);
+    // exit(0);
 
+    half * src0_data_host = new half[4096];
+    float * src1_data_host = new float[4096];
+    cudaMemcpy(src0_data_host, src0_dd_i, 4096 * sizeof(half), cudaMemcpyDeviceToHost);
+    cudaMemcpy(src1_data_host, src1_ddf_i, 4096 * sizeof(float), cudaMemcpyDeviceToHost);
+    print_data_to_file<GGML_TYPE_F16>("simple.txt", src0->name, (char const *)src0_data_host);
+    print_data_to_file<GGML_TYPE_F32>("simple.txt", src1->name, (char const *)src1_data_host);
+    // exit(0);
+
+    // print_data_to_file<GGML_TYPE_F32>("simple.txt", src1->name, (char const *)src1->data);
     // on some GPUs it is faster to convert src1 to half and to use half precision intrinsics
 #ifdef GGML_CUDA_F16
     size_t ash;
@@ -7320,6 +7515,13 @@ inline void ggml_cuda_op_mul_mat_vec_sparse_dequantized(
             GGML_ASSERT(false && "Unsupported type");
             break;
     }
+
+    // cudaSync
+    cudaDeviceSynchronize();
+    float * dst_host = new float[11008];
+    cudaMemcpy(dst_host, dst_dd_i, 11008 * sizeof(float), cudaMemcpyDeviceToHost);
+    print_data_to_file<GGML_TYPE_F32>("simple.txt", dst->name, (char const *)dst_host, 11008);
+    exit(0);
 
     (void) src1;
     (void) dst;
@@ -7720,7 +7922,8 @@ inline void ggml_cuda_op_mul_mat_cublas(
                     &alpha_f16, src0_ptr, CUDA_R_16F, ne00,
                                 src1_ptr, CUDA_R_16F, ne10,
                     &beta_f16,   dst_f16, CUDA_R_16F, ldc,
-                    CUBLAS_COMPUTE_16F,
+                    // CUBLAS_COMPUTE_16F,
+                    CUDA_R_16F,
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
@@ -8208,7 +8411,7 @@ static void ggml_cuda_op_mul_mat(
             }
         }
     }
-
+    // printf("g_dev : %d\n", g_device_count);
     for (int64_t id = 0; id < g_device_count; ++id) {
         if ((!split && id != g_main_device) || row_low[id] == row_high[id]) {
             continue;
@@ -8330,6 +8533,10 @@ static void ggml_cuda_op_mul_mat(
                 }
 
                 // do the computation
+                // if (src1->ne[1] == 1) {
+                //     printf("%p %p %p %p %p %p %p, %ld, %ld, %ld, %ld\n", src0->data, src1->data, dst->data, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
+                //         row_low[id], row_high[id], src1_ncols, src1_padded_col_size);
+                // }
                 op(src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
                    row_low[id], row_high[id], src1_ncols, src1_padded_col_size, stream);
                 CUDA_CHECK(cudaGetLastError());
@@ -8658,7 +8865,8 @@ static void ggml_cuda_mul_mat_mat_batched_cublas(const ggml_tensor * src0, const
                             (const char *) src1_as_f16, CUDA_R_16F, nb11/sizeof(float), src1->nb[2]/sizeof(float), // strideB
                 &beta_f16,  (      char *)     dst_f16, CUDA_R_16F, ne01,                dst->nb[2]/sizeof(float), // strideC
                 ne12*ne13,
-                CUBLAS_COMPUTE_16F,
+                // CUBLAS_COMPUTE_16F,
+                CUDA_R_16F,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     } else {
         // use cublasGemmBatchedEx
@@ -8692,7 +8900,8 @@ static void ggml_cuda_mul_mat_mat_batched_cublas(const ggml_tensor * src0, const
                             (const void **) (ptrs_src + 1*ne23), CUDA_R_16F, nb11/sizeof(float),
                 &beta_f16,  (      void **) (ptrs_dst + 0*ne23), CUDA_R_16F, ne01,
                 ne23,
-                CUBLAS_COMPUTE_16F,
+                // CUBLAS_COMPUTE_16F,
+                CUDA_R_16F,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
         if (ptrs_src_s != 0) {
@@ -8802,10 +9011,135 @@ static void ggml_cuda_mul_mat_sparse(const ggml_tensor * src0, const ggml_tensor
     }
 }
 
+template <bool Full_offload, ggml_type T_type, bool Up_relu>
+void ggml_cuda_compute_ffn_fusion(ggml_tensor * dst) {
+    // printf("here\n");
+    const ggml_tensor * cur = dst->src[0];
+    const ggml_tensor * up = dst->src[1];
+    const ggml_tensor * gate = dst->src[2];
+    const ggml_tensor * down = dst->src[3];
+    const ggml_tensor * sparse_idx = dst->src[4];
+    const ggml_tensor * gpu_bucket = dst->src[6];
+
+    auto cur_extra = reinterpret_cast<ggml_tensor_extra_gpu *>(cur->extra);
+    auto up_extra = reinterpret_cast<ggml_tensor_extra_gpu *>(up->extra);
+    auto gate_extra = reinterpret_cast<ggml_tensor_extra_gpu *>(gate->extra);
+    auto down_extra = reinterpret_cast<ggml_tensor_extra_gpu *>(down->extra);
+    auto dst_extra = reinterpret_cast<ggml_tensor_extra_gpu *>(dst->extra);
+    // char const * cur_d_p = static_cast<char const *>(cur_extra->data_device[0]);
+    // char const * gate_d_p = static_cast<char const *>(gate_extra->data_device[0]);
+    float const * cur_data = static_cast<float const *>(cur_extra->data_device[0]);
+    void const * up_data = static_cast<void const *>(up_extra->data_device[0]);
+    void const * gate_data = static_cast<void const *>(gate_extra->data_device[0]);
+    void const * down_data = static_cast<void const *>(down_extra->data_device[0]);
+    float * dst_data = static_cast<float *>(dst_extra->data_device[0]);
+
+    const float * sparse_idx_data = static_cast<float const *>(ggml_cuda_get_tensor_data(sparse_idx));
+    const int * gpu_bucket_data = Full_offload ? nullptr : static_cast<int const *>(ggml_cuda_get_tensor_data(gpu_bucket));
+
+    int const n_rows = up->ne[1];
+    int const n_cols = up->ne[0];
+    int const input_rows = cur->ne[1];
+    // printf("%f", (float)(((half *)up->data)[0]));
+    // printf("up relu is %d, full off is %d\n", Up_relu, Full_offload);
+    // printf("col is %ld, row is %ld\n", n_cols, n_rows);
+    // ! DEBUG
+    {
+        // float * cur_ = new float[4096];
+        // half * gate_ = new half[4096];
+        // cudaMemcpy(cur_, cur_data, 4096 * sizeof(float), cudaMemcpyDeviceToHost);
+        // cudaMemcpy(gate_, gate_data, 4096 * sizeof(half), cudaMemcpyDeviceToHost);
+        // print_data_to_file<GGML_TYPE_F16>("fusion.txt", gate->name, (char const *)gate_);
+        // print_data_to_file<GGML_TYPE_F32>("fusion.txt", cur->name, (char const *)cur_);
+        // print_data_to_file<GGML_TYPE_F32>("fusion.txt", cur->name, (char const *)cur->data);
+        // print_data_to_file<GGML_TYPE_F16>("fusion.txt", up_name, static_cast<char const *>(up_data));
+        // print_data_to_file<GGML_TYPE_F16>("fusion.txt", down_name, static_cast<char const *>(down_data));
+    }
+    constexpr int stream_id = 0, stream_is = 0;
+    cudaStream_t const stream = g_cudaStreams[stream_id][stream_is];
+
+    float * up_val = new float[11008];
+    float * gate_val = new float[11008];
+    float * up_val_d{nullptr}, *gate_val_d{nullptr};
+    cudaMalloc(&up_val_d, 11008 * sizeof(float));
+    cudaMalloc(&gate_val_d, 11008 * sizeof(float));
+    cudaMemsetAsync(up_val_d, 0, 11008 * sizeof(float), stream);
+    cudaMemsetAsync(gate_val_d, 0, 11008 * sizeof(float), stream);
+    cudaMemsetAsync((void *)dst_data, 0, ggml_nbytes(dst), stream);
+    if (input_rows == 1) {
+        if constexpr (Full_offload) {
+            int const block_num_y = (n_rows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+            dim3 const block_dim(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+            dim3 const grid_dim(1, block_num_y, 1);
+            ffn_all_gpu_vec<Up_relu, T_type, convert_f16, true><<<grid_dim, block_dim, 0, stream>>>(
+                cur_data, n_rows, n_cols, up_data, gate_data, down_data, sparse_idx_data, gpu_bucket_data, dst_data
+                    , up_val_d, gate_val_d
+            );
+        } else {
+            int const block_num_y = (n_rows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+            dim3 const block_dim(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+            dim3 const grid_dim(1, block_num_y, 1);
+            ffn_all_gpu_vec<Up_relu, T_type, convert_f16, false><<<grid_dim, block_dim, 0, stream>>>(
+                cur_data, n_rows, n_cols, up_data, gate_data, down_data, sparse_idx_data, gpu_bucket_data, dst_data
+                    , up_val_d, gate_val_d
+            );
+        }
+    } else {
+        
+    }
+    
+    // ! DEBUG
+    {   
+        // cudaDeviceSynchronize();
+        // printf("gate val is %p", gate_val_d);
+        // cudaMemcpy(up_val, up_val_d, 11008 * sizeof(float), cudaMemcpyDeviceToHost);
+        // cudaMemcpy(gate_val, gate_val_d, 11008 * sizeof(float), cudaMemcpyDeviceToHost);
+        // cudaDeviceSynchronize();
+        // print_data_to_file<GGML_TYPE_F32>("fusion.txt", "middle mul gate", (char const *)gate_val, 11008);
+        // print_data_to_file<GGML_TYPE_F32>("fusion.txt", "middle mul up", up_val);
+        // exit(0);
+    }
+    
+}
+
+static void ggml_cuda_ffn_fusion(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // ? src0 is f32
+#define SWITCH_FFN(full_off, up_relu) \
+    switch (src1->type) { \
+    case GGML_TYPE_F16: \
+        ggml_cuda_compute_ffn_fusion<full_off, GGML_TYPE_F16, up_relu>(dst); \
+        break; \
+    case GGML_TYPE_Q4_0: \
+    default: \
+        GGML_ASSERT(false and "not supported quant"); \
+        break; \
+    } \
+    
+    const bool up_relu = dst->op_params[2] == 1 ? true : false;
+    const bool full_off = dst->op_params[1] == 1 ? true : false;
+    // printf("%s -> %s -> %s -> %s -> %s\n", dst->src[0]->name, 
+    //     dst->src[1]->name, dst->src[2]->name, dst->src[3]->name, dst->src[4]->name);
+    
+    if (up_relu) {
+        if (full_off) {
+            SWITCH_FFN(true, true)
+        } else {
+            SWITCH_FFN(false, true)
+        }
+    } else {
+        if (full_off) {
+            SWITCH_FFN(true, false)
+        } else {
+            SWITCH_FFN(false, false)
+        }
+    }
+}
+
 void ggml_cuda_axpy(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(dst->src[2] != NULL && "dst->src[2] must be present for axpy");
     bool all_on_device = (src0->backend == GGML_BACKEND_GPU || src0->backend == GGML_BACKEND_GPU_SPLIT) &&
         src1->backend == GGML_BACKEND_GPU && dst->backend == GGML_BACKEND_GPU;
+        // printf("src1 ne 1 is %ld\n", src1->ne[1]);
     if (src1->ne[1] > 100) {
         ggml_cuda_op_mul_mat(src0, src1, dst, ggml_cuda_op_mul_mat_transpose_gemm, false);
     } else {
@@ -9286,6 +9620,14 @@ bool ggml_cuda_compute_forward(struct ggml_compute_params * params, struct ggml_
             }
             func = ggml_cuda_mul_mat_sparse;
             break;
+        case GGML_OP_FFN_FUSION:
+            {
+                if (!any_on_device) {
+                    printf("not all on GPU device!\n");
+                    return false;
+                }
+                func = ggml_cuda_ffn_fusion;
+            } break;
         case GGML_OP_AXPY:
             func = ggml_cuda_axpy;
             break;

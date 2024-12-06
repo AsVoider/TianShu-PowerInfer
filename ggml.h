@@ -229,7 +229,7 @@
 #define GGML_MAX_DIMS           4
 #define GGML_MAX_PARAMS         1024
 #define GGML_MAX_CONTEXTS       64
-#define GGML_MAX_SRC            6
+#define GGML_MAX_SRC            8
 #define GGML_MAX_NAME           64
 #define GGML_MAX_OP_PARAMS      64
 #define GGML_DEFAULT_N_THREADS  4
@@ -412,6 +412,7 @@ extern "C" {
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_SPARSE,
+        GGML_OP_FFN_FUSION,
         GGML_OP_AXPY,
         GGML_OP_OUT_PROD,
 
@@ -1104,6 +1105,17 @@ extern "C" {
             struct ggml_tensor *sparse_idx,
             struct ggml_tensor *gpu_bucket,
                         int64_t result_ne0);
+    GGML_API struct ggml_tensor * ggml_ffn_fusion(
+            struct ggml_context * ctx,
+            struct ggml_tensor * ffn_input,
+            struct ggml_tensor * up,
+            struct ggml_tensor * gate,
+            struct ggml_tensor * down,
+            struct ggml_tensor * sparse_idx,
+            struct ggml_tensor * gpu_idx,
+            struct ggml_tensor * gpu_bucket,
+            bool up_relu
+    );
     GGML_API struct ggml_tensor *ggml_axpy(
             struct ggml_context *ctx,
             struct ggml_tensor  * a,

@@ -4155,6 +4155,44 @@ struct ggml_tensor * ggml_mul_mat_idx(
     return result;
 }
 
+GGML_API struct ggml_tensor * ggml_ffn_fusion(
+            struct ggml_context * ctx,
+            struct ggml_tensor * ffn_input,
+            struct ggml_tensor * up,
+            struct ggml_tensor * gate,
+            struct ggml_tensor * down,
+            struct ggml_tensor * sparse_idx,
+            struct ggml_tensor * gpu_idx,
+            struct ggml_tensor * gpu_bucket,
+            bool up_relu
+) {
+    GGML_ASSERT(!ggml_is_transposed(up));
+    GGML_ASSERT(!ggml_is_transposed(gate));
+
+    bool is_node = false;
+    if (up->grad || gate->grad || ffn_input->grad) {
+        is_node = true;
+    }
+    
+    const int64_t ne[4] = {ffn_input->ne[0], ffn_input->ne[1], ffn_input->ne[2], ffn_input->ne[3]};
+    struct ggml_tensor * res = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    res->op = GGML_OP_FFN_FUSION;
+    res->grad = is_node ? ggml_dup_tensor(ctx, res) : NULL;
+    res->src[0] = ffn_input;
+    res->src[1] = up;
+    res->src[2] = gate;
+    res->src[3] = down;
+    res->src[4] = sparse_idx;
+    res->src[5] = gpu_idx;
+    res->src[6] = gpu_bucket;
+
+    int32_t params[] = {gpu_idx ? 0 : 1, gpu_bucket ? 0 : 1, up_relu ? 1 : 0};
+    ggml_set_op_params(res, params, sizeof(params));
+
+    return res;
+}
+
 struct ggml_tensor * ggml_axpy(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -16707,6 +16745,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
 #endif
             } break;
         case GGML_OP_MUL_MAT_SPARSE:
+        case GGML_OP_FFN_FUSION:
         case GGML_OP_AXPY:
             {
                 n_tasks = n_threads;
@@ -17228,6 +17267,7 @@ struct ggml_cplan ggml_graph_plan(struct ggml_cgraph * cgraph, int n_threads) {
                     }
                 } break;
             case GGML_OP_MUL_MAT:
+            case GGML_OP_FFN_FUSION:
             case GGML_OP_MUL_MAT_SPARSE:
                 {
                     const enum ggml_type vec_dot_type = type_traits[node->src[0]->type].vec_dot_type;
