@@ -413,6 +413,7 @@ extern "C" {
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_SPARSE,
         GGML_OP_FFN_FUSION,
+        GGML_OP_MUL_MAT_RELU_FUSION,
         GGML_OP_AXPY,
         GGML_OP_OUT_PROD,
 
@@ -1114,6 +1115,15 @@ extern "C" {
             struct ggml_tensor * sparse_idx,
             struct ggml_tensor * gpu_idx,
             struct ggml_tensor * gpu_bucket,
+            bool up_relu
+    );
+    GGML_API struct ggml_tensor * ggml_mul_mat_relu_fusion(
+            struct ggml_context * ctx, 
+            struct ggml_tensor * ffn_input,
+            struct ggml_tensor * up,
+            struct ggml_tensor * gate,
+            struct ggml_tensor * sparse_idx,
+            struct ggml_tensor * gpu_idx,
             bool up_relu
     );
     GGML_API struct ggml_tensor *ggml_axpy(

@@ -1612,6 +1612,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MUL_MAT",
     "MUL_MAT_SPARSE",
     "FFN_FUSION",
+    "MUL_MAT_RELU_FUSION",
     "AXPY",
     "OUT_PROD",
 
@@ -1774,6 +1775,8 @@ static void ggml_setup_op_has_task_pass(void) {
         p[GGML_OP_ACC                    ] = true;
         p[GGML_OP_MUL_MAT                ] = true;
         p[GGML_OP_MUL_MAT_SPARSE         ] = true;
+        p[GGML_OP_FFN_FUSION             ] = true;
+        p[GGML_OP_MUL_MAT_RELU_FUSION    ] = true;
         p[GGML_OP_AXPY                   ] = true;
         p[GGML_OP_OUT_PROD               ] = true;
         p[GGML_OP_SET                    ] = true;
@@ -4193,6 +4196,37 @@ GGML_API struct ggml_tensor * ggml_ffn_fusion(
 
     return res;
 }
+
+GGML_API struct ggml_tensor * ggml_mul_mat_relu_fusion(
+    struct ggml_context * ctx, 
+    struct ggml_tensor * ffn_input,
+    struct ggml_tensor * up,
+    struct ggml_tensor * gate,
+    struct ggml_tensor * sparse_idx,
+    struct ggml_tensor * gpu_idx,
+    bool up_relu
+) {
+    bool is_node = false;
+    if (up->grad || gate->grad || ffn_input->grad) {
+        is_node = true;
+    }
+
+    int64_t const ne[4] = { up->ne[1], ffn_input->ne[1], ffn_input->ne[2], ffn_input->ne[3] };
+    struct ggml_tensor * res = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    res->op = GGML_OP_MUL_MAT_RELU_FUSION;
+    res->grad = is_node ? ggml_dup_tensor(ctx, res) : NULL;
+    res->src[0] = ffn_input;
+    res->src[1] = up;
+    res->src[2] = gate;
+    res->src[3] = sparse_idx;
+    res->src[4] = gpu_idx;
+
+    int32_t params[] = { gpu_idx ? 0 : 1, up_relu ? 1 : 0};
+    ggml_set_op_params(res, params, sizeof(params));
+
+    return res;
+}                 
 
 struct ggml_tensor * ggml_axpy(
         struct ggml_context * ctx,
@@ -14066,6 +14100,29 @@ static void ggml_compute_forward_mul_mat_sparse_head(
 
 }
 
+static void print_nquant_to_file(char const *file_name, char const *tensor_name, char *data, size_t step, size_t num) {
+    FILE *file = fopen(file_name, "a+");
+    fprintf(file, "%s ", tensor_name);
+    if (step == 2) {
+        GGML_ASSERT((num == 4096 || num == 11008)&& "num not equal 4096");
+        float num_to_print[11008] = {0.0f};
+        ggml_fp16_to_fp32_row((ggml_fp16_t const *)data, num_to_print, num);
+        for (size_t i = 0; i < num; ++i) {
+            fprintf(file, "%f ", num_to_print[i]);
+        }
+        fprintf(file, "\n\n");
+    } else if (step == 4) {
+        for (size_t i = 0; i < num; ++i) {
+            float *f_data = (float *)data;
+            fprintf(file, "%f ", f_data[i]);
+        }
+        fprintf(file, "\n\n");
+    } else {
+        GGML_ASSERT(false && "wrong step");
+    }
+    fclose(file);
+}
+
 static void ggml_compute_forward_mul_mat_sparse(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * src0,
@@ -14320,6 +14377,297 @@ static void ggml_compute_forward_mul_mat_sparse(
     //     printf("predictor %d predictor_cpu %d\n", predictor, predictor_cpu);
 }
 
+atomic_flag g_ffn_sparse = ATOMIC_FLAG_INIT;
+
+static void ggml_compute_ffn_chunk(
+    struct ggml_compute_params const * params,
+    struct ggml_tensor * dst,
+    int64_t const num_rows_per_vec_dot,
+    int64_t const ir0_start,
+    int64_t const ir0_end,
+    int64_t const ir1_start,
+    int64_t const ir1_end
+    // , float *gate_data_tmp, float *up_data_tmp, float *up_gate_tmp
+) {
+    GGML_ASSERT(num_rows_per_vec_dot == 1);
+
+    int64_t dst_ne0 = dst->ne[0], dst_ne1 = dst->ne[1];
+    struct ggml_tensor * cur = dst->src[0]; int64_t cur_ne0 = cur->ne[0], cur_ne1 = cur->ne[1];
+    struct ggml_tensor * up = dst->src[1]; int64_t up_ne0 = up->ne[0], up_ne1 = up->ne[1];
+    struct ggml_tensor * gate = dst->src[2]; int64_t gate_ne0 = gate->ne[0], gate_ne1 = gate->ne[1];
+    struct ggml_tensor * down = dst->src[3]; int64_t down_ne0 = down->ne[0], down_ne1 = gate->ne[1];
+    struct ggml_tensor * sparse_idx = dst->src[4]; 
+    struct ggml_tensor * gpu_index = dst->src[5]; int const *gid = (int const *)gpu_index->data;
+
+    UNUSED(down_ne1); UNUSED(down_ne0); UNUSED(gate_ne0); UNUSED(gate_ne1); UNUSED(up_ne1); UNUSED(cur_ne1); UNUSED(dst_ne1);
+
+    bool const up_relu = dst->op_params[2] == 1 ? true : false;
+    bool const cur_cont = ggml_is_contiguous(cur);
+    enum ggml_type const type_up = up->type;
+
+    ggml_vec_dot_t const vec_dot = type_traits[type_up].vec_dot;
+    enum ggml_type const vec_dot_type = type_traits[type_up].vec_dot_type;
+
+    float const threshold = sparse_pred_threshold;
+
+    // todo: select axpy
+    typedef void (*axpy_func_t) (int, void const * GGML_RESTRICT, void const *, void *, float);
+    axpy_func_t axpy_func = NULL;
+    switch (down->type)
+    {
+    case GGML_TYPE_F16:
+        axpy_func = ggml_axpy_fp16_fp32;
+        break;
+    case GGML_TYPE_Q4_0:
+    default:
+        abort();
+    }
+
+    if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
+        return;
+    }
+
+    void const *wdata = (cur->type == vec_dot_type) ? cur->data : params->wdata;
+    size_t const row_size = cur_ne0 * ggml_type_size(vec_dot_type) / ggml_blck_size(vec_dot_type);
+    size_t const sparse_idx_row_size = sparse_idx->nb[1];
+
+    int64_t const blk_0 = 16;
+    int64_t const blk_1 = 16;
+
+    // ? 变长数组???
+    float vec[dst_ne0 * blk_1];
+    char const *up_row = (char const *)up->data;
+    char const *down_row = (char const *)down->data;
+    char const *gate_row = (char const *)gate->data;
+
+    for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blk_1) {
+        memset(vec, 0, dst_ne0 * sizeof(float) * MIN(ir1_end - iir1, blk_1));
+
+        for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blk_0) {
+            for (int64_t ir1 = iir1; ir1 < iir1 + blk_1 && ir1 < ir1_end; ++ir1) {
+                int64_t const i11 = ir1;
+                float const *sparse_score = (float const *)((char const *)sparse_idx->data + i11 * sparse_idx_row_size);
+
+                char const *cur_row = (char const *)wdata + ((cur_cont || cur->type != vec_dot_type) ? i11 * row_size : i11 * cur->nb[1]);
+                float *vec_row = (float *)((char *)vec + (ir1 - iir1) * dst->nb[1]);
+                // do compute
+                for (int64_t ir0 = iir0; ir0 < iir0 + blk_0 && ir0 < ir0_end; ++ir0) {
+                    if (!gpu_index || gid[ir0] == 1 || sparse_score[ir0] < threshold) {
+                        continue;
+                    }
+
+                    float gate_val = 0.0;
+                    vec_dot(up_ne0, &gate_val, gate_row + ir0 * gate->nb[1], cur_row);
+                    // ! Debug Mark
+
+                    if (gate_val <= 0.0f) {
+                        continue;
+                    }
+
+                    float up_val = 0.0;
+                    vec_dot(up_ne0, &up_val, up_row + ir0 * up->nb[1], cur_row);
+
+                    if (up_relu && up_val <= 0.0f) {
+                        continue;
+                    }
+
+                    float const up_gate = gate_val * up_val;
+                    // todo: axpy
+                    axpy_func(up_ne0, (char const *)down_row + ir0 * down->nb[1], vec_row, vec_row, up_gate);
+                }
+            }
+        }
+
+        while (atomic_flag_test_and_set(&g_ffn_sparse)) { }
+        // printf("ith : %d, into, %ld : %ld\n", params->ith, ir0_start, ir0_end);
+        for (int64_t ir1 = iir1; ir1 < iir1 + blk_1 && ir1 < ir1_end; ++ir1) {
+            float * dst_col = (float *)((char *)dst->data + (ir1 * dst->nb[1]));
+            float * vec_col = (float *)((char *)vec + (ir1 - iir1) * dst->nb[1]);
+
+            ggml_axpy_store_fp32(dst_ne0, vec_col, dst_col, 1);
+        }
+        atomic_flag_clear(&g_ffn_sparse);
+        // printf("ith : %d, out, %ld : %ld\n", params->ith, ir0_start, ir0_end);
+    }
+}
+
+static void ggml_compute_forward_ffn_fusion_part(
+    const struct ggml_compute_params * params,
+    struct ggml_tensor * dst
+) {
+    int64_t t0 = ggml_perf_time_us();
+    UNUSED(t0);
+
+    struct ggml_tensor * cur = dst->src[0];
+    struct ggml_tensor * up = dst->src[1];
+    struct ggml_tensor * gate = dst->src[2];
+    struct ggml_tensor * sparse_idx = dst->src[3];
+    struct ggml_tensor * gpu_index = dst->src[4];
+
+    bool const up_relu = dst->op_params[1] == 1 ? true : false;
+
+    GGML_TENSOR_LOCALS(int64_t, cur_ne, cur, ne)
+    GGML_TENSOR_LOCALS(size_t, cur_nb, cur, nb)
+    GGML_TENSOR_LOCALS(int64_t, up_ne, up, ne)
+    GGML_TENSOR_LOCALS(size_t, up_nb, up, nb)
+    GGML_TENSOR_LOCALS(size_t, dst_nb, dst, nb)
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const enum ggml_type type = up->type;
+
+    const bool cur_cont = ggml_is_contiguous(cur);
+
+    ggml_vec_dot_t    const vec_dot               = type_traits[type].vec_dot;
+    enum ggml_type    const vec_dot_type          = type_traits[type].vec_dot_type;
+    ggml_from_float_t const from_float_to_vec_dot = type_traits[vec_dot_type].from_float;
+
+    const float threshold = sparse_pred_threshold;
+
+    // broadcast factors
+    const int64_t r2 = cur_ne2/up_ne2;
+    const int64_t r3 = cur_ne3/up_ne3;
+
+    if (params->type == GGML_TASK_INIT) {
+        if (cur->type != vec_dot_type) {
+            char * wdata = params->wdata;
+            const size_t row_size = cur_ne0*ggml_type_size(vec_dot_type)/ggml_blck_size(vec_dot_type);
+
+            for (int64_t i13 = 0; i13 < cur_ne3; ++i13) {
+                for (int64_t i12 = 0; i12 < cur_ne2; ++i12) {
+                    for (int64_t i11 = 0; i11 < cur_ne1; ++i11) {
+                        from_float_to_vec_dot((float *)((char *) cur->data + i13*cur_nb3 + i12*cur_nb2 + i11*cur_nb1), (void *) wdata, cur_ne0);
+                        wdata += row_size;
+                    }
+                }
+            }
+        }
+
+        memset((void *)dst->data, 0, dst->ne[0] * sizeof(float));
+        atomic_store(params->aic, 0);
+
+        return;
+    }
+
+    if (params->type == GGML_TASK_FINALIZE) {
+        return;
+    }
+
+    const void * wdata    = (cur->type == vec_dot_type) ? cur->data : params->wdata;
+    // ! Debug
+    // {
+    //     if (dst->ne[1] == 1) {
+    //         print_nquant_to_file("simple.txt", src0->name, src0->data, 2, 4096);
+    //         print_nquant_to_file("simple.txt", src1->name, (char *)wdata, 2, 4096); 
+    //     }
+    // }
+    const size_t row_size = cur_ne0*ggml_type_size(vec_dot_type)/ggml_blck_size(vec_dot_type);
+
+    const int64_t nr0 = up_ne1;           // src0 rows
+    const int64_t nr1 = cur_ne1*cur_ne2*cur_ne3; // src1 rows
+
+    const int64_t nth0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
+    const int64_t nth1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
+
+    const int64_t ith0 = ith % nth0;
+    const int64_t ith1 = ith / nth0;
+
+    const int64_t dr0 = (nr0 + 8*nth0 - 1)/(8*nth0);
+    const int64_t dr1 = (nr1 + nth1 - 1)/nth1;
+
+    int64_t ir010 = dr0*ith0;
+    int64_t ir011 = MIN(ir010 + dr0, nr0);
+
+    const int64_t ir110 = dr1*ith1;
+    const int64_t ir111 = MIN(ir110 + dr1, nr1);
+
+    assert(cur_ne2 % up_ne2 == 0);
+    assert(cur_ne3 % up_ne3 == 0);
+
+    // block-tiling attempt
+    // const int64_t blck_0 = 16;
+    const int64_t blck_1 = 16;
+    // int total = 0;
+    float *ffdata = (float *)sparse_idx->data;
+    int *gid = (int *)gpu_index->data;
+    float *predictor_data = (float *)sparse_idx->data;
+    const size_t predictor_row_size = sparse_idx->ne[0]*ggml_type_size(GGML_TYPE_F32)/ggml_blck_size(GGML_TYPE_F32);
+
+    while(true) {
+        ir010 = atomic_fetch_add(params->aic, dr0);
+        ir011 = MIN(ir010 + dr0, nr0);
+        for (int64_t ir0 = ir010; ir0 < ir011; ++ir0)
+        {
+            for (int64_t iir1 = ir110; iir1 < ir111; iir1 += blck_1)
+            {
+                if (ir0 > nr0)
+                    break;
+
+                for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir111; ++ir1)
+                {
+                    const int64_t i13 = (ir1 / (cur_ne2 * cur_ne1));
+                    const int64_t i12 = (ir1 - i13 * cur_ne2 * cur_ne1) / cur_ne1;
+                    const int64_t i11 = (ir1 - i13 * cur_ne2 * cur_ne1 - i12 * cur_ne1);
+
+                    // broadcast src0 into src1
+                    const int64_t i03 = i13 / r3;
+                    const int64_t i02 = i12 / r2;
+
+                    const int64_t i1 = i11;
+                    const int64_t i2 = i12;
+                    const int64_t i3 = i13;
+
+                    const char *up_row = (const char *)up->data + (0 + i02 * up_nb2 + i03 * up_nb3);
+                    const char *gate_row = (const char *)gate->data + (0 + i02 * up_nb2 + i03 * up_nb3);
+
+                    // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
+                    //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
+                    //       the original src1 data pointer, so we should index using the indices directly
+                    // TODO: this is a bit of a hack, we should probably have a better way to handle this
+                    const char *cur_col = (const char *)wdata +
+                                           (cur_cont || cur->type != vec_dot_type
+                                                ? (i11 + i12 * cur_ne1 + i13 * cur_ne2 * cur_ne1) * row_size
+                                                : (i11 * cur_nb1 + i12 * cur_nb2 + i13 * cur_nb3));
+                    ffdata = (float *)((char *)predictor_data + (i11      + i12*cur_ne1 + i13*cur_ne2*cur_ne1)*predictor_row_size);
+                    // printf("ith %d row %d ir1 %d %d %d %d %d\n", ith, ir0, ir1, src1_col-(char *)wdata, ffdata-predictor_data, predictor_row_size, dst->src[2]->ne[1]);
+
+                    float *dst_col = (float *)((char *)dst->data + (i1 * dst_nb1 + i2 * dst_nb2 + i3 * dst_nb3));
+
+                    if (gid[ir0] == 1 || ffdata[ir0] < threshold) {
+                        continue;
+                    }
+                    float up_v = 0.0f, gate_v = 0.0f;
+                    vec_dot(up_ne0, &gate_v, gate_row + ir0 * up_nb1, cur_col);
+                    // ! Gate Relu
+                    if (gate_v <= 0.0f) {
+                        continue;
+                    }
+
+                    vec_dot(up_ne0, &up_v, up_row + ir0 * up_nb1, cur_col);
+                    if (up_relu && up_v <= 0.0f) {
+                        continue;
+                    }
+
+                    dst_col[ir0] = gate_v * up_v;
+                }
+            }
+        }
+        if (ir010 + dr0 >= nr0) {
+            break;
+        }
+        
+    }
+    // ! Debug
+    {   
+        // printf("here\n");
+        // if (dst->ne[1] == 1) {
+        //     print_nquant_to_file("fusion.txt", dst->name, dst->data, 4, 11008);
+        //     exit(0);
+        // }
+    }
+}
+
 // vz = alpha * vx + vy  
 static void ggml_axpy_normal_f16(const int n, const ggml_fp16_t * vx, const ggml_fp16_t * restrict vy, void* restrict vz, ggml_fp16_t alpha) {
     float *res = (float *)vz;
@@ -14447,6 +14795,14 @@ static void ggml_compute_forward_mul_mat_axpy(
     void *vy = vec;
     char* src0_row = (char *) src0->data;
     ggml_fp16_t * src1_ptr = NULL;
+
+    // ! Debug
+    // {
+    //     if (src1->ne[1] == 1) {
+    //         print_nquant_to_file("fusion.txt", src1->name, (char *)wdata, 2, 11008);
+    //         print_nquant_to_file("fusion.txt", src0->name, (char *)src0->data, 2, 4096);
+    //     }
+    // }
     for (int col_idx = 0; col_idx < nr1; col_idx++) {
         src1_ptr = (ggml_fp16_t *)((char *)wdata + col_idx * row_size);
         sparse_idx = (float *)((char *)src2->data + col_idx * idx_row_size);
@@ -14499,6 +14855,13 @@ static void ggml_compute_forward_mul_mat_axpy(
 #if defined(_MSC_VER)
     _freea(vec);
 #endif
+    // ! Debug
+    // {
+    //     if (src1->ne[1] == 1) {
+    //         print_nquant_to_file("simple.txt", dst->name, dst->data, 4, 4096);
+    //         exit(0);
+    //     }
+    // }
 }
 
 static void ggml_compute_forward_mul_mat_axpy_q4_0(
@@ -14948,6 +15311,17 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                     ggml_compute_forward_mul_mat_sparse_head(params, tensor->src[0], tensor->src[1], tensor);
                     // ggml_compute_forward_mul_mat(params, tensor->src[0], tensor->src[1], tensor);
                 } 
+            } break;
+        case GGML_OP_FFN_FUSION:
+            {
+                GGML_ASSERT(false && "only GPU");
+            } break;
+        case GGML_OP_MUL_MAT_RELU_FUSION:
+            {
+                GGML_ASSERT(tensor->src[3] != NULL && "sparsity index is required for FFN FUSION");
+                ggml_ensure_tensor_data_at_memory(tensor->src[0]);
+                ggml_ensure_tensor_data_at_memory(tensor->src[3]);
+                ggml_compute_forward_ffn_fusion_part(params, tensor);
             } break;
         case GGML_OP_AXPY:
             {
@@ -16235,6 +16609,11 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
             {
                 GGML_ASSERT(false);
             } break;
+        case GGML_OP_FFN_FUSION:
+        case GGML_OP_MUL_MAT_RELU_FUSION:
+            {
+                GGML_ASSERT(false);
+            } break;
     }
 
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
@@ -16747,6 +17126,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_MUL_MAT_SPARSE:
         case GGML_OP_FFN_FUSION:
+        case GGML_OP_MUL_MAT_RELU_FUSION:
         case GGML_OP_AXPY:
             {
                 n_tasks = n_threads;
@@ -17268,7 +17648,6 @@ struct ggml_cplan ggml_graph_plan(struct ggml_cgraph * cgraph, int n_threads) {
                     }
                 } break;
             case GGML_OP_MUL_MAT:
-            case GGML_OP_FFN_FUSION:
             case GGML_OP_MUL_MAT_SPARSE:
                 {
                     const enum ggml_type vec_dot_type = type_traits[node->src[0]->type].vec_dot_type;
@@ -17288,6 +17667,14 @@ struct ggml_cplan ggml_graph_plan(struct ggml_cgraph * cgraph, int n_threads) {
 #endif
                     if (node->src[1]->type != vec_dot_type) {
                         cur = ggml_type_size(vec_dot_type)*ggml_nelements(node->src[1])/ggml_blck_size(vec_dot_type);
+                    }
+                } break;
+            case GGML_OP_FFN_FUSION:
+            case GGML_OP_MUL_MAT_RELU_FUSION:
+                {
+                    enum ggml_type const vec_dot_type = type_traits[node->src[1]->type].vec_dot_type;
+                    if (node->src[0]->type != vec_dot_type) {
+                        cur = ggml_type_size(vec_dot_type) * ggml_nelements(node->src[0]) / ggml_blck_size(vec_dot_type);
                     }
                 } break;
             case GGML_OP_AXPY:

@@ -2508,6 +2508,54 @@ void ggml_axpy_q4_0_q8_0(const int n, const void * restrict vx, const void * res
 #endif
 }
 
+void ggml_axpy_fp16_fp32(int n, const void * GGML_RESTRICT vx, const void * vy, void * vz, float scale) {
+    const ggml_fp16_t *x = (const ggml_fp16_t *)vx;
+    const float *      y = (const float *)vy;
+          float *      z = (float *)vz;
+
+    const int step  = 32;
+    const int np    = (n & ~(step - 1));
+    __m256 scale_vec = _mm256_set1_ps(scale);
+    __m256 ax[4];
+    __m256 ay[4];
+    for (int i = 0; i < np; i += step) {
+        for (int j = 0; j < 4; j++) {
+            // process 8 float numbers at once
+            ax[j] = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x + i + j * 8)));
+            ay[j] = _mm256_loadu_ps(y + i + j * 8);
+            ay[j] = _mm256_fmadd_ps(ax[j], scale_vec, ay[j]);
+            
+            _mm256_storeu_ps(z + i + j * 8, ay[j]);
+        }
+    }
+    // leftovers
+    for (int i = np; i < n; ++i) {
+        z[i] = GGML_FP16_TO_FP32(x[i]) * scale + y[i];
+    }    
+}
+
+void ggml_axpy_store_fp32(int n, float const * GGML_RESTRICT vx, float * GGML_RESTRICT vy, float scale) {
+    if (scale == 1) {
+        int i = 0;
+        for (; i + 8 < n; i += 8) {
+            __m256 const a   = _mm256_loadu_ps(vy + i);
+            __m256 const b   = _mm256_loadu_ps(vx + i);
+            __m256 const res = _mm256_add_ps(a, b);
+            _mm256_storeu_ps(vy + i, res);
+        }
+        for(; i < n; ++i) { vy[i] += vx[i]; }
+    } else {
+        int i = 0;
+        __m256 const v_scale = _mm256_set1_ps(scale);
+        for (; i + 8 < n; i += 8) {
+            const __m256 a   = _mm256_loadu_ps(vy + i);
+            const __m256 b   = _mm256_loadu_ps(vx + i);
+            const __m256 res = _mm256_fmadd_ps(b, v_scale, a);
+            _mm256_storeu_ps(vy + i, res);
+        }
+        for (; i < n; ++i) { vy[i] += vx[i] * scale; }
+    }
+}
 
 void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, const void * restrict vx, const void * restrict vy) {
     const int qk = QK8_0;

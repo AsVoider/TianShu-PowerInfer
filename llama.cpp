@@ -4555,11 +4555,14 @@ static struct ggml_tensor * llm_build_ffn_sprase_new_cpu(
     struct ggml_tensor * down_cpu,
     struct ggml_tensor * sparse_idx,
     struct ggml_tensor * gpu_index,
+    const llm_build_cb_short & cb,
     bool up_relu
     // ,
 ) {
     ggml_tensor * out = nullptr;
-    out = ggml_ffn_fusion(ctx, cur, up_cpu, gate_cpu, down_cpu, sparse_idx, gpu_index, NULL, up_relu);
+    out = ggml_mul_mat_relu_fusion(ctx, cur, up_cpu, gate_cpu, sparse_idx, gpu_index, up_relu);
+    cb(out, "up_gate_relu_mul_cpu");
+    out = ggml_axpy(ctx, down_cpu, out, sparse_idx, gpu_index);
     return out;
 }
 
@@ -4631,7 +4634,7 @@ static struct ggml_tensor * llm_build_ffn_sparse_new(
 #endif
 
     out = llm_build_ffn_sprase_new_cpu(
-        ctx, cur, up, gate, down_t, idx, gpu_index, up_relu
+        ctx, cur, up, gate, down_t, idx, gpu_index, cb, up_relu
     );
     cb(out, (ffn_name + "_cpu").c_str());
 
