@@ -4758,12 +4758,6 @@ __global__ void ffn_all_gpu_vec(
             tmp1 += v1.x * cur_data[iybs + iqs + j/qr + 0];
             tmp1 += v1.y * cur_data[iybs + iqs + j/qr + y_offset];
 
-            // if (row == 0 && tid == 0) {
-            //     half const * ptr = (half const *)gate_data;
-            //     printf("%f, %f, %f, %f, %f, %f\n", v1.x, v1.y,(float)ptr[ib + iqs + j / qr + 0], (float)ptr[ib + iqs + j / qr + y_offset], 
-            //         cur_data[iybs + iqs + j/qr + 0], cur_data[iybs + iqs + j/qr + y_offset]);
-                
-            // }
         }
     }
 
@@ -4794,7 +4788,7 @@ __global__ void ffn_all_gpu_vec(
 
     for (int i = 0; i < n_cols; i += iter_stride) {
         const int col   = i + vals_per_iter*tid;
-        const int ib    = (row * n_cols + col) / qk; // x block index
+        const int ib    = (gpu_row * n_cols + col) / qk; // x block index
         const int iqs   = (col % qk) / qr; // x quant index
         const int iybs  = col - col % qk; // y block start index
 
@@ -7392,13 +7386,31 @@ void print_data_to_file(char const * file_name, char const * tensor_name, char c
             fprintf(file, "%f ", b);
             data += 2;
         }
-        fprintf(file, "\n");
+        fprintf(file, "\n\n");
     } 
     if constexpr (T_type == GGML_TYPE_F32) {
         for (int i{0}; i < num; i++) {
             float a = *((float const *)data);
             fprintf(file, "%f ", a);
             data += 4;
+        }
+        fprintf(file, "\n\n");
+    }
+
+    fclose(file);
+}
+
+template <ggml_type T_type>
+void print_col_data_to_file(char const * file_name, char const * tensor_name, char const * data, int const * hash, int const col_num = 11008) {
+    printf("printing!\n");
+    FILE *file = fopen(file_name, "a+");
+    fprintf(file, "%s : ", tensor_name);
+    if constexpr (T_type == GGML_TYPE_F16) {
+        for (int i{0}; i < col_num; ++i) {
+            half a = *((half const *)data);
+            float b = a;
+            fprintf(file, "%d : %f\n", hash[i], b);
+            data += 4096 * 2;
         }
         fprintf(file, "\n");
     }
@@ -7468,24 +7480,7 @@ inline void ggml_cuda_op_mul_mat_vec_sparse_dequantized(
 
     float * sparse_idx = static_cast<float *>(ggml_cuda_get_tensor_data(dst->src[2]));
     int32_t * row_lookup = dst->src[3] != NULL ? static_cast<int32_t *>(ggml_cuda_get_tensor_data(dst->src[3])) : NULL;
-    // for (auto i{0}; i < 11008; ++i) {
-    //     printf("%f ", sparse_idx[i]);
-    // }
-    // printf("back is %d\n", dst->src[2]->backend);
-    // cudaPointerAttributes attr;
-    // cudaPointerGetAttributes(&attr, src1->data);
-    // printf("attr type is %d\n", attr.type);
-    // exit(0);
-
-    half * src0_data_host = new half[4096];
-    float * src1_data_host = new float[4096];
-    cudaMemcpy(src0_data_host, src0_dd_i, 4096 * sizeof(half), cudaMemcpyDeviceToHost);
-    cudaMemcpy(src1_data_host, src1_ddf_i, 4096 * sizeof(float), cudaMemcpyDeviceToHost);
-    print_data_to_file<GGML_TYPE_F16>("simple.txt", src0->name, (char const *)src0_data_host);
-    print_data_to_file<GGML_TYPE_F32>("simple.txt", src1->name, (char const *)src1_data_host);
-    // exit(0);
-
-    // print_data_to_file<GGML_TYPE_F32>("simple.txt", src1->name, (char const *)src1->data);
+    
     // on some GPUs it is faster to convert src1 to half and to use half precision intrinsics
 #ifdef GGML_CUDA_F16
     size_t ash;
@@ -7515,12 +7510,6 @@ inline void ggml_cuda_op_mul_mat_vec_sparse_dequantized(
             break;
     }
 
-    // cudaSync
-    cudaDeviceSynchronize();
-    float * dst_host = new float[11008];
-    cudaMemcpy(dst_host, dst_dd_i, 11008 * sizeof(float), cudaMemcpyDeviceToHost);
-    print_data_to_file<GGML_TYPE_F32>("simple.txt", dst->name, (char const *)dst_host, 11008);
-    exit(0);
 
     (void) src1;
     (void) dst;
@@ -9037,29 +9026,10 @@ void ggml_cuda_compute_ffn_fusion(ggml_tensor * dst) {
     int const n_rows = up->ne[1];
     int const n_cols = up->ne[0];
     int const input_rows = cur->ne[1];
-    
-    // ! DEBUG
-    {
-        // float * cur_ = new float[4096];
-        // half * gate_ = new half[4096];
-        // cudaMemcpy(cur_, cur_data, 4096 * sizeof(float), cudaMemcpyDeviceToHost);
-        // cudaMemcpy(gate_, gate_data, 4096 * sizeof(half), cudaMemcpyDeviceToHost);
-        // print_data_to_file<GGML_TYPE_F16>("fusion.txt", gate->name, (char const *)gate_);
-        // print_data_to_file<GGML_TYPE_F32>("fusion.txt", cur->name, (char const *)cur_);
-        // print_data_to_file<GGML_TYPE_F32>("fusion.txt", cur->name, (char const *)cur->data);
-        // print_data_to_file<GGML_TYPE_F16>("fusion.txt", up_name, static_cast<char const *>(up_data));
-        // print_data_to_file<GGML_TYPE_F16>("fusion.txt", down_name, static_cast<char const *>(down_data));
-    }
+
     constexpr int stream_id = 0, stream_is = 0;
     cudaStream_t const stream = g_cudaStreams[stream_id][stream_is];
 
-    // float * up_val = new float[11008];
-    // float * gate_val = new float[11008];
-    // float * up_val_d{nullptr}, *gate_val_d{nullptr};
-    // cudaMalloc(&up_val_d, 11008 * sizeof(float));
-    // cudaMalloc(&gate_val_d, 11008 * sizeof(float));
-    // cudaMemsetAsync(up_val_d, 0, 11008 * sizeof(float), stream);
-    // cudaMemsetAsync(gate_val_d, 0, 11008 * sizeof(float), stream);
 
     cudaMemsetAsync((void *)dst_data, 0, ggml_nbytes(dst), stream);
     if (input_rows == 1) {
@@ -9083,19 +9053,6 @@ void ggml_cuda_compute_ffn_fusion(ggml_tensor * dst) {
     } else {
         
     }
-    
-    // ! DEBUG
-    {   
-        // cudaDeviceSynchronize();
-        // printf("gate val is %p", gate_val_d);
-        // cudaMemcpy(up_val, up_val_d, 11008 * sizeof(float), cudaMemcpyDeviceToHost);
-        // cudaMemcpy(gate_val, gate_val_d, 11008 * sizeof(float), cudaMemcpyDeviceToHost);
-        // cudaDeviceSynchronize();
-        // print_data_to_file<GGML_TYPE_F32>("fusion.txt", "middle mul gate", (char const *)gate_val, 11008);
-        // print_data_to_file<GGML_TYPE_F32>("fusion.txt", "middle mul up", up_val);
-        // exit(0);
-    }
-    
 }
 
 static void ggml_cuda_ffn_fusion(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {

@@ -4632,9 +4632,14 @@ static struct ggml_tensor * llm_build_ffn_sparse_new(
         return out;
     }
 #endif
-
+    ggml_tensor * norm_cpu = nullptr;
+    if (cur->backend != GGML_BACKEND_CPU) {
+        norm_cpu = ggml_dup(ctx, cur);
+    } else {
+        norm_cpu = cur;
+    }
     out = llm_build_ffn_sprase_new_cpu(
-        ctx, cur, up, gate, down_t, idx, gpu_index, cb, up_relu
+        ctx, norm_cpu, up, gate, down_t, idx, gpu_index, cb, up_relu
     );
     cb(out, (ffn_name + "_cpu").c_str());
 
@@ -5053,10 +5058,16 @@ struct llm_build_context {
                         ggml_set_name(cur, name_str.c_str());
                     };
                     // We only offload the ffn input to GPU if all neurons are offloaded
-                    if (model.layers[il].gpu_offload_ratio >= 1.) {
-                        cb(cur, "ffn_norm", il);
-                    } else {
+                    // ! Mark if offload, always on GPU
+                    // if (model.layers[il].gpu_offload_ratio >= 1.f) {
+                    //     cb(cur, "ffn_norm", il);
+                    // } else {
+                    //     cbs(cur, "ffn_norm");
+                    // }
+                    if (cur->ne[1] > 1 || model.layers[il].gpu_offload_ratio == 0.0f) {
                         cbs(cur, "ffn_norm");
+                    } else {
+                        cb(cur, "ffn_norm", il);
                     }
                     cur = llm_build_ffn_sparse(ctx0, cur,
                         model.layers[il].ffn_up,   NULL,

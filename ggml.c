@@ -14558,8 +14558,9 @@ static void ggml_compute_forward_ffn_fusion_part(
     // ! Debug
     // {
     //     if (dst->ne[1] == 1) {
-    //         print_nquant_to_file("simple.txt", src0->name, src0->data, 2, 4096);
-    //         print_nquant_to_file("simple.txt", src1->name, (char *)wdata, 2, 4096); 
+    //         print_nquant_to_file("tmp.txt", cur->name, cur->data, 4, 4096);
+    //         print_nquant_to_file("tmp.txt", "wdata__", wdata, 4, 4096);
+    //         print_nquant_to_file("tmp.txt", gate->name, gate->data, 2, 4096); 
     //     }
     // }
     const size_t row_size = cur_ne0*ggml_type_size(vec_dot_type)/ggml_blck_size(vec_dot_type);
@@ -14662,7 +14663,8 @@ static void ggml_compute_forward_ffn_fusion_part(
     {   
         // printf("here\n");
         // if (dst->ne[1] == 1) {
-        //     print_nquant_to_file("fusion.txt", dst->name, dst->data, 4, 11008);
+        //     print_nquant_to_file("tmp.txt", "gate_tmp", gate_tmp, 4, 11008);
+        //     print_nquant_to_file("tmp.txt", "up_tmp", up_tmp, 4, 11008);
         //     exit(0);
         // }
     }
@@ -14858,7 +14860,7 @@ static void ggml_compute_forward_mul_mat_axpy(
     // ! Debug
     // {
     //     if (src1->ne[1] == 1) {
-    //         print_nquant_to_file("simple.txt", dst->name, dst->data, 4, 4096);
+    //         print_nquant_to_file("tmp.txt", dst->name, dst->data, 4, 4096);
     //         exit(0);
     //     }
     // }
