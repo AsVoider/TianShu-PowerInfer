@@ -2110,7 +2110,6 @@ struct llama_model_loader {
     }
 
     void load_all_data(struct ggml_context * ctx, llama_progress_callback progress_callback, void * progress_callback_user_data, llama_mlock * lmlock) {
-        printf("here3\n");
         size_t size_data = 0;
         size_t size_lock = 0;
         size_t size_pref = 0; // prefetch
@@ -4680,12 +4679,19 @@ static struct ggml_tensor * llm_build_ffn_sparse(
 
     // ! patch jump to fusion
     if (cur->ne[1] == 1) {
-        auto out = llm_build_ffn_sparse_new(ctx, cur, up, up_b, gate, gate_b, down_t, down_b, pre_w1, pre_w2,  pred_inpl,
+        auto out = llm_build_ffn_sparse_new(ctx, cur, up, up_b, gate, gate_b, down_t, down_b, pre_w1, pre_w2, pred_inpl,
             gpu_index, gpu_bucket, gate_gpu, down_gpu, up_gpu, type_op, type_gate, gpu_offload_ratio, cb_outer);
         return out;
-    }
+    }  
 
     bool full_gpu = gpu_offload_ratio >= 1.0;
+
+    // if (full_gpu) { // ! tmp full gpu prefill
+    //     auto out = llm_build_ffn_sparse_new(ctx, cur, up, up_b, gate, gate_b, down_t, down_b, pre_w1, pre_w2, pred_inpl, 
+    //         gpu_index, gpu_bucket, gate_gpu, down_gpu, up_gpu, type_op, type_gate, gpu_offload_ratio, cb_outer);
+    //     return out;
+    // }
+
     ggml_tensor * ffn_input = cur;
 
     llm_build_cb_short cb = [&cb_outer](struct ggml_tensor * tensor, const char * name) {
@@ -4698,12 +4704,7 @@ static struct ggml_tensor * llm_build_ffn_sparse(
         }
 #endif
     };
-    // print_shape(cur, "input");
-    // print_shape(up, "up");
-    // print_shape(up_gpu, "up_gpu");
-    // print_shape(gate, "gate");
-    // print_shape(gate_gpu, "gate_gpu");
-    // print_shape(down_t, "down");
+
     // prepare sparse idx
     ggml_tensor * idx = ggml_mul_mat(ctx, pre_w1, pred_inpl);
     cb(idx, "mlp_pre_hidden");
@@ -4713,10 +4714,6 @@ static struct ggml_tensor * llm_build_ffn_sparse(
     // If the FFN layer is not fully offloaded, we need to transfer the sparsity index
     // back to the CPU to avoid synchronization issues.
     (full_gpu ? cb : cb_outer)(idx, "mlp_pre_out");
-    // print_shape(pre_w1, "pre1");
-    // print_shape(idx, "idx");
-    // print_shape(gpu_index, "gpu_index");
-    // print_shape(gpu_bucket, "gpu_budget");
 
     auto act_fn = [&](ggml_tensor * tensor, const char * name) {
         switch (type_op) {

@@ -4914,7 +4914,7 @@ static __global__ void dequantize_mul_mat_batch_sparse(const void * __restrict__
     const int vals_per_iter = iter_stride / WARP_SIZE; // num quantized vals per thread and i iter
     const int y_offset = qr == 1 ? 1 : qk/2;
     float * loop_idx = idx;;
-    dfloat * loop_y = (dfloat *)y;
+    dfloat * loop_y = const_cast<dfloat *>(y);
     float * loop_dst = dst;
 
 
@@ -7578,7 +7578,6 @@ __global__ void markRows(float *X, int *marks, int rows) {
 __global__ void markRowsPosition(int *input, int *output, int rows, int *cols) {
     //TODO :idx need to bucket
     int idx = threadIdx.x + blockDim.x * blockIdx.x;
-    int predict_idx = idx;
     if (idx >= rows) return;
 
     int32_t sum = 0;
@@ -8316,6 +8315,7 @@ static void ggml_cuda_op_mul_mat(
     const int64_t ne02 = src0->ne[2];
     const int64_t ne03 = src0->ne[3];
     const int64_t nrows0 = ggml_nrows(src0);
+    (void)(nrows0);
 
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
@@ -8657,6 +8657,7 @@ bool ggml_cuda_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_te
 
     const int64_t ne10 = src1->ne[0];
     const int64_t ne01 = src0->ne[1];
+    (void)(ne01);
 
     const int64_t ne0 = dst->ne[0];
     const int64_t ne1 = dst->ne[1];
@@ -9033,36 +9034,28 @@ void ggml_cuda_compute_ffn_fusion(ggml_tensor * dst) {
 
     cudaMemsetAsync((void *)dst_data, 0, ggml_nbytes(dst), stream);
     if (input_rows == 1) {
-        if constexpr (Full_offload) {
             int const block_num_y = (n_rows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
             dim3 const block_dim(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
             dim3 const grid_dim(1, block_num_y, 1);
-            ffn_all_gpu_vec<Up_relu, T_type, dequantize_kernel, true><<<grid_dim, block_dim, 0, stream>>>(
+            ffn_all_gpu_vec<Up_relu, T_type, dequantize_kernel, Full_offload><<<grid_dim, block_dim, 0, stream>>>(
                 cur_data, n_rows, n_cols, up_data, gate_data, down_data, sparse_idx_data, gpu_bucket_data, dst_data
                     // , up_val_d, gate_val_d
             );
-        } else {
-            int const block_num_y = (n_rows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
-            dim3 const block_dim(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-            dim3 const grid_dim(1, block_num_y, 1);
-            ffn_all_gpu_vec<Up_relu, T_type, dequantize_kernel, false><<<grid_dim, block_dim, 0, stream>>>(
-                cur_data, n_rows, n_cols, up_data, gate_data, down_data, sparse_idx_data, gpu_bucket_data, dst_data
-                    // , up_val_d, gate_val_d
-            );
-        }
     } else {
         
     }
 }
 
 static void ggml_cuda_ffn_fusion(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    // ? src0 is f32
+
 #define SWITCH_FFN(full_off, up_relu) \
     switch (src1->type) { \
     case GGML_TYPE_F16: \
         ggml_cuda_compute_ffn_fusion<full_off, GGML_TYPE_F16, convert_f16, up_relu>(dst); \
         break; \
     case GGML_TYPE_Q4_0: \
+        ggml_cuda_compute_ffn_fusion<full_off, GGML_TYPE_Q4_0, dequantize_q4_0, up_relu>(dst); \
+        break; \
     default: \
         GGML_ASSERT(false and "not supported quant"); \
         break; \
@@ -9090,7 +9083,7 @@ void ggml_cuda_axpy(const ggml_tensor * src0, const ggml_tensor * src1, ggml_ten
     GGML_ASSERT(dst->src[2] != NULL && "dst->src[2] must be present for axpy");
     bool all_on_device = (src0->backend == GGML_BACKEND_GPU || src0->backend == GGML_BACKEND_GPU_SPLIT) &&
         src1->backend == GGML_BACKEND_GPU && dst->backend == GGML_BACKEND_GPU;
-        // printf("src1 ne 1 is %ld\n", src1->ne[1]);
+    (void)(all_on_device);
     if (src1->ne[1] > 100) {
         ggml_cuda_op_mul_mat(src0, src1, dst, ggml_cuda_op_mul_mat_transpose_gemm, false);
     } else {
