@@ -2787,7 +2787,6 @@ struct llama_gpu_split_loader {
     }
 
     int load_gpu_idx_for_model(llama_model * model) {
-        printf("here1\n");
         int n_layers = model->layers.size();
         // TODO: assert fp is at the end of headers
         if (n_tensors != n_layers * 2) {
@@ -2952,6 +2951,7 @@ struct llama_augmentation_model_loader {
         // Set sparsity threshold via global virables
         sparse_pred_threshold = model->hparams.sparse_pred_threshold;
 #if defined (GGML_USE_CUBLAS)
+        model->hparams.sparse_pred_threshold += 0.5f;
         ggml_cuda_set_device_constants(model->hparams.sparse_pred_threshold);
 #endif
 
@@ -4686,11 +4686,11 @@ static struct ggml_tensor * llm_build_ffn_sparse(
 
     bool full_gpu = gpu_offload_ratio >= 1.0;
 
-    // if (full_gpu) { // ! tmp full gpu prefill
-    //     auto out = llm_build_ffn_sparse_new(ctx, cur, up, up_b, gate, gate_b, down_t, down_b, pre_w1, pre_w2, pred_inpl, 
-    //         gpu_index, gpu_bucket, gate_gpu, down_gpu, up_gpu, type_op, type_gate, gpu_offload_ratio, cb_outer);
-    //     return out;
-    // }
+    if (full_gpu) { // ! tmp full gpu prefill
+        auto out = llm_build_ffn_sparse_new(ctx, cur, up, up_b, gate, gate_b, down_t, down_b, pre_w1, pre_w2, pred_inpl, 
+            gpu_index, gpu_bucket, gate_gpu, down_gpu, up_gpu, type_op, type_gate, gpu_offload_ratio, cb_outer);
+        return out;
+    }
 
     ggml_tensor * ffn_input = cur;
 
@@ -5061,7 +5061,7 @@ struct llm_build_context {
                     // } else {
                     //     cbs(cur, "ffn_norm");
                     // }
-                    if (cur->ne[1] > 1 || model.layers[il].gpu_offload_ratio == 0.0f) {
+                    if (model.layers[il].gpu_offload_ratio < 1.0f && cur->ne[1] > 1) {
                         cbs(cur, "ffn_norm");
                     } else {
                         cb(cur, "ffn_norm", il);

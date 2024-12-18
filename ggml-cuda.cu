@@ -1718,7 +1718,7 @@ static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __
 template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_impl(
     const int * v, const int * u, const float & d4, const half2 & ds8) {
 
-#if __CUDA_ARCH__ >= MIN_CC_DP4A // lowest compute capability for integer intrinsics
+// #if __CUDA_ARCH__ >= MIN_CC_DP4A // lowest compute capability for integer intrinsics
     int sumi = 0;
 
 #pragma unroll
@@ -1735,10 +1735,10 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_imp
 
     // second part effectively subtracts 8 from each quant value
     return d4 * (sumi * ds8f.x - (8*vdr/QI4_0) * ds8f.y);
-#else
-    assert(false);
-    return 0.0f; // only to satisfy the compiler
-#endif // __CUDA_ARCH__ >= MIN_CC_DP4A
+// #else
+    // assert(false);
+    // return 0.0f; // only to satisfy the compiler
+// #endif // __CUDA_ARCH__ >= MIN_CC_DP4A
 }
 
 #define VDR_Q4_1_Q8_1_MMVQ 2
@@ -2206,7 +2206,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
     const int & vl, const int & vh, const int * __restrict__ u, const int8_t * __restrict__ scales,
     const float & d, const float * __restrict__ d8) {
 
-#if __CUDA_ARCH__ >= MIN_CC_DP4A // lowest compute capability for integer intrinsics
+// #if __CUDA_ARCH__ >= MIN_CC_DP4A // lowest compute capability for integer intrinsics
     float sumf = 0.0f;
 
 #pragma unroll
@@ -2223,10 +2223,10 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
     }
 
     return d*sumf;
-#else
-    assert(false);
-    return 0.0f; // only to satisfy the compiler
-#endif // __CUDA_ARCH__ >= MIN_CC_DP4A
+// #else
+    // assert(false);
+    // return 0.0f; // only to satisfy the compiler
+// #endif // __CUDA_ARCH__ >= MIN_CC_DP4A
 }
 
 // contiguous u/y values
@@ -4813,6 +4813,108 @@ __global__ void ffn_all_gpu_vec(
     }
 }
 
+template <bool Up_relu, ggml_type T_type, dequantize_kernel_t dequantize_kernel, bool Full_offload = true>
+__global__ void ffn_all_gpu_batch(
+    float const * __restrict__ cur_data,
+    int const n_rows, // 11008
+    int const n_cols, // 4096
+    int const cur_rows, // cur.ne[1]
+    int const sparse_idx_nb1, // sparse_idx.nb[1]
+    int const dst_ne0, // dst.ne[0]
+    void const * __restrict__ up_data,
+    void const * __restrict__ gate_data,
+    void const * __restrict__ down_data,
+    float const * __restrict__ sparse_idx_data,
+    int const * __restrict__ gpu_index_data,
+    float * __restrict__ dst_data
+    , float * tmp_up_val = nullptr, float * tmp_gate_val = nullptr
+) {
+    constexpr int qk = ggml_cuda_type_traits<T_type>::qk;
+    constexpr int qr = ggml_cuda_type_traits<T_type>::qr;
+
+    int const gpu_row = blockIdx.y * blockDim.y + threadIdx.y;
+    int const row = Full_offload ? gpu_row : gpu_index_data[gpu_row];
+
+    if (gpu_row >= n_rows) {
+        return;
+    }
+
+    int const tid = threadIdx.x;
+
+    int const iter_stride = 2 * GGML_CUDA_DMMV_X;
+    int const vals_per_iter = iter_stride / WARP_SIZE;
+    int const y_offset = qr == 1 ? 1 : qk / 2;
+
+    float * loop_dst = dst_data - dst_ne0;
+    float const * loop_cur = cur_data - n_cols;
+    float const * loop_idx = (float const *)((char const *)sparse_idx_data - sparse_idx_nb1);
+    // float * loop_up = tmp_up_val - 11008;
+    // float * loop_gate = tmp_gate_val - 11008;
+
+    for (int col_id = 0; col_id < cur_rows; ++col_id) {
+        loop_dst += dst_ne0;
+        loop_cur += n_cols;
+        loop_idx = (float const *)((char const *)loop_idx + sparse_idx_nb1);
+        // loop_up += 11008;
+        // loop_gate += 11008;
+        if (loop_idx[row] < dev_sparse_threshold) {
+            continue;
+        }
+
+        float tmp = 0.0f, tmp1 = 0.0f;
+        for (int i = 0; i < n_cols; i += iter_stride) {
+            const int col = i + vals_per_iter * tid;
+            const int ib = (gpu_row * n_cols + col) / qk; // x block index
+            const int iqs = (col % qk)/qr; // x quant index
+            const int iybs = col - col % qk; // y block start index
+#pragma unroll
+            for (int j = 0; j < vals_per_iter; j += 2) {
+                float2 v, v1;
+                dequantize_kernel(up_data, ib, iqs + j / qr, v);
+                dequantize_kernel(gate_data, ib, iqs + j / qr, v1);
+
+                tmp += v.x * loop_cur[iybs + iqs + j/qr + 0];
+                tmp += v.y * loop_cur[iybs + iqs + j/qr + y_offset];
+
+                tmp1 += v1.x * loop_cur[iybs + iqs + j/qr + 0];
+                tmp1 += v1.y * loop_cur[iybs + iqs + j/qr + y_offset];
+            }
+        }
+
+        float const sum_up = warp_reduce_sum(tmp);
+        float const sum_gate = warp_reduce_sum(tmp1);
+
+        // if (tid == 0) {
+        //     loop_up[gpu_row] = sum_up;
+        //     loop_gate[gpu_row] = sum_gate;
+        // }
+
+        if (sum_gate <= 0.0f) { return; }
+
+        if (Up_relu and sum_up <= 0.0f) { return; }
+
+        float const tmp_u_g = sum_up * sum_gate;
+
+        for (int i = 0; i < n_cols; i += iter_stride) {
+            const int col   = i + vals_per_iter*tid;
+            const int ib    = (gpu_row * n_cols + col) / qk; // x block index
+            const int iqs   = (col % qk) / qr; // x quant index
+            const int iybs  = col - col % qk; // y block start index
+
+            for (int j = 0; j < vals_per_iter; j += 2) {
+                float2 v;
+                dequantize_kernel(down_data, ib, iqs + j / qr, v);
+
+                int const idx_0 = iybs + iqs + j / qr;
+                int const idx_1 = idx_0 + y_offset;
+
+                atomicAdd(&loop_dst[idx_0], v.x * tmp_u_g);
+                atomicAdd(&loop_dst[idx_1], v.y * tmp_u_g);
+            }
+        }
+    }
+}
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
 static __global__ void dequantize_mul_mat_vec_sparse(const void * __restrict__ vx, const dfloat * __restrict__ y, float * __restrict__ dst, const int ncols, const int nrows, int * lst, float * idx) {
     // qk = quantized weights per x block
@@ -6921,6 +7023,39 @@ void ** ggml_cuda_get_data_pp(struct ggml_tensor * tensor) {
     return &extra->data_device[0];
 }
 
+template <ggml_type T_type>
+void print_data_to_file(char const * file_name, char const * tensor_name, char const * data, int const num) {
+    FILE *file = fopen(file_name, "a+");
+    fprintf(file, "%s : ", tensor_name);
+    if constexpr (T_type == GGML_TYPE_F16) {
+        for (int i{0}; i < num; i++) {
+            half a = *((half const *)data);
+            float b = a;
+            fprintf(file, "%f ", b);
+            data += 2;
+        }
+        fprintf(file, "\n\n");
+    } 
+    if constexpr (T_type == GGML_TYPE_F32) {
+        for (int i{0}; i < num; i++) {
+            float a = *((float const *)data);
+            fprintf(file, "%f ", a);
+            data += 4;
+        }
+        fprintf(file, "\n\n");
+    }
+
+    fclose(file);
+}
+
+static void print_shape(const ggml_tensor * tensor) {
+    int64_t const * ne_ptr = tensor->ne;
+    size_t const * nb_ptr = tensor->nb;
+    printf("%s : %ld, %ld, %ld, %ld; %ld, %ld, %ld, %ld, %d, %d\n", tensor->name, 
+        ne_ptr[0], ne_ptr[1], ne_ptr[2], ne_ptr[3], 
+        nb_ptr[0], nb_ptr[1], nb_ptr[2], nb_ptr[3], tensor->backend, tensor->type);
+}
+
 inline void ggml_cuda_op_add(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
     const float * src0_dd, const float * src1_dd, float * dst_dd, const cudaStream_t & main_stream) {
@@ -6932,9 +7067,9 @@ inline void ggml_cuda_op_add(
 
     if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         ggml_tensor * src2 = dst->src[2];
-        if (src2 == NULL)
+        if (src2 == NULL) {
             add_f32_cuda(src0_dd, src1_dd, dst_dd, ggml_nelements(src0), ne10*ne11, main_stream);
-        else {
+        } else {
             float *idx = (src2->backend == GGML_BACKEND_GPU) ? (float *)((ggml_tensor_extra_gpu *)(src2->extra))->data_device[0] : (float *)src2->data;
             add_idx_f32_cuda(src0_dd, src1_dd, dst_dd, idx, ggml_nelements(src0), ne10*ne11, main_stream);
         }
@@ -6946,6 +7081,23 @@ inline void ggml_cuda_op_add(
         fprintf(stderr, "src0->type: %d  dst->type: %d\n", src0->type, dst->type);
         GGML_ASSERT(false);
     }
+
+    // if (src0->ne[1] == 1 && strcmp(dst->name, "l_out-31") == 0) {
+    //     cudaDeviceSynchronize();
+
+    //     cudaStreamSynchronize(main_stream);
+    //     float * src1_data = new float[4096 * src1->ne[1]];
+    //     float * dst_data = new float[4096 * dst->ne[1]];
+    //     float * src0_data = new float[4096 * src0->ne[1]];
+    //     cudaMemcpy(src1_data, src1_dd, 4096 * src1->ne[1] * sizeof(float), cudaMemcpyDeviceToHost);
+    //     cudaMemcpy(dst_data, dst_dd, 4096 * dst->ne[1] * sizeof(float), cudaMemcpyDeviceToHost);
+    //     cudaMemcpy(src0_data, src0_dd, 4096 * sizeof(float), cudaMemcpyDeviceToHost);
+    //     cudaDeviceSynchronize();
+    //     print_data_to_file<GGML_TYPE_F32>("fusion1.txt", src0->name, (char const *)src0_data, 4096 * src0->ne[1]);
+    //     print_data_to_file<GGML_TYPE_F32>("fusion1.txt", src1->name, (char const *)src1_data, 4096 * src1->ne[1]);
+    //     print_data_to_file<GGML_TYPE_F32>("fusion1.txt", dst->name, (char const *)dst_data, 4096 * dst->ne[1]);
+    //     exit(0);
+    // }
 
     (void) src1;
     (void) dst;
@@ -7055,6 +7207,20 @@ inline void ggml_cuda_op_rms_norm(
 
     rms_norm_f32_cuda(src0_dd, dst_dd, ne00, nrows, eps, main_stream);
 
+    // printf("dst name is %s, %s\n", dst->name, src0->name);
+    // if (src0->ne[1] == 1 && strcmp(dst->name, "norm") == 0) {
+    //     cudaDeviceSynchronize();
+    //     cudaStreamSynchronize(main_stream);
+    //     float * src0_data = new float[4096 * src0->ne[1]];
+    //     float * dst_data = new float[4096 * dst->ne[1]];
+    //     cudaMemcpy(src0_data, src0_dd, 4096 * src0->ne[1] * sizeof(float), cudaMemcpyDeviceToHost);
+    //     cudaMemcpy(dst_data, dst_dd, 4096 * dst->ne[1] * sizeof(float), cudaMemcpyDeviceToHost);
+    //     cudaDeviceSynchronize();
+    //     print_data_to_file<GGML_TYPE_F32>("fusion.txt", src0->name, (char const *)src0_data, 4096 * src0->ne[1]);
+    //     print_data_to_file<GGML_TYPE_F32>("fusion.txt", dst->name, (char const *)dst_data, 4096 * dst->ne[1]);
+    //     exit(0);
+    // }
+
     (void) src1;
     (void) dst;
     (void) src1_dd;
@@ -7116,6 +7282,26 @@ inline void ggml_cuda_op_mul_mat_q(
             GGML_ASSERT(false);
             break;
     }
+
+    // cudaDeviceSynchronize();
+    // float * deq{nullptr};
+    // cudaMalloc(&deq, 4096 * sizeof(float));
+    // cudaMemsetAsync(deq, 0, 4096 * sizeof(float), stream);
+    // dequantize_row_q4_0_cuda(src0_dd_i, deq, 4096, stream);
+
+    // cudaStreamSynchronize(stream);
+    // float * src1_data = new float[4096 * src1->ne[1]];
+    // float * dst_data = new float[4096 * dst->ne[1]];
+    // float * deq_data = new float[4096];
+    // cudaMemcpy(src1_data, src1_ddf_i, 4096 * src1->ne[1] * sizeof(float), cudaMemcpyDeviceToHost);
+    // cudaMemcpy(dst_data, dst_dd_i, 4096 * dst->ne[1] * sizeof(float), cudaMemcpyDeviceToHost);
+    // cudaMemcpy(deq_data, deq, 4096 * sizeof(float), cudaMemcpyDeviceToHost);
+    // cudaDeviceSynchronize();
+    // print_data_to_file<GGML_TYPE_F32>("fusion1.txt", src1->name, (char const *)src1_data, 4096 * src1->ne[1]);
+    // print_data_to_file<GGML_TYPE_F32>("fusion1.txt", dst->name, (char const *)dst_data, 4096 * src1->ne[1]);
+    // print_data_to_file<GGML_TYPE_F32>("fusion1.txt", "deq_src0", (char const *)deq_data, 4096);
+    // exit(0);
+
 
     (void) src1;
     (void) dst;
@@ -7285,6 +7471,26 @@ inline void ggml_cuda_op_mul_mat_vec_q(
             break;
     }
 
+    // if (src1->ne[1] == 1) {
+    //     cudaDeviceSynchronize();
+    //     float * deq{nullptr};
+    //     cudaMalloc(&deq, 4096 * sizeof(float));
+    //     cudaMemsetAsync(deq, 0, 4096 * sizeof(float), stream);
+    //     dequantize_row_q4_0_cuda(src0_dd_i, deq, 4096, stream);
+    //     cudaStreamSynchronize(stream);
+    //     float * src1_data = new float[4096 * src1->ne[1]];
+    //     float * dst_data = new float[4096 * dst->ne[1]];
+    //     float * deq_data = new float[4096];
+    //     cudaMemcpy(src1_data, src1_ddf_i, 4096 * src1->ne[1] * sizeof(float), cudaMemcpyDeviceToHost);
+    //     cudaMemcpy(dst_data, dst_dd_i, 4096 * dst->ne[1] * sizeof(float), cudaMemcpyDeviceToHost);
+    //     cudaMemcpy(deq_data, deq, 4096 * sizeof(float), cudaMemcpyDeviceToHost);
+    //     cudaDeviceSynchronize();
+    //     print_data_to_file<GGML_TYPE_F32>("fusion1.txt", src1->name, (char const *)src1_data, 4096 * src1->ne[1]);
+    //     print_data_to_file<GGML_TYPE_F32>("fusion1.txt", dst->name, (char const *)dst_data, 4096 * src1->ne[1]);
+    //     print_data_to_file<GGML_TYPE_F32>("fusion1.txt", "deq_src0", (char const *)deq_data, 4096);
+    //     exit(0);
+    // }
+
     (void) src1;
     (void) dst;
     (void) src1_ddf_i;
@@ -7369,35 +7575,6 @@ inline void ggml_cuda_op_dequantize_mul_mat_vec(
     (void) src1_ddq_i;
     (void) src1_ncols;
     (void) src1_padded_row_size;
-}
-
-template <ggml_type T_type>
-void print_data_to_file(char const * file_name, char const * tensor_name, char const * data, int const num = 4096) {
-    FILE *file = fopen(file_name, "a+");
-    // if (!file) {
-    //     printf("error!\n");
-    //     exit(1);
-    // }
-    fprintf(file, "%s : ", tensor_name);
-    if constexpr (T_type == GGML_TYPE_F16) {
-        for (int i{0}; i < num; i++) {
-            half a = *((half const *)data);
-            float b = a;
-            fprintf(file, "%f ", b);
-            data += 2;
-        }
-        fprintf(file, "\n\n");
-    } 
-    if constexpr (T_type == GGML_TYPE_F32) {
-        for (int i{0}; i < num; i++) {
-            float a = *((float const *)data);
-            fprintf(file, "%f ", a);
-            data += 4;
-        }
-        fprintf(file, "\n\n");
-    }
-
-    fclose(file);
 }
 
 template <ggml_type T_type>
@@ -7953,6 +8130,25 @@ inline void ggml_cuda_op_mul_mat_cublas(
             ggml_cuda_pool_free(src0_ddq_as_f32, src0_as);
         }
     }
+
+    // cudaDeviceSynchronize();
+    // float * deq{nullptr};
+    // cudaMalloc(&deq, 4096 * sizeof(float));
+    // cudaMemsetAsync(deq, 0, 4096 * sizeof(float), stream);
+    // dequantize_row_q4_0_cuda(src0_dd_i, deq, 4096, stream);
+    // cudaStreamSynchronize(stream);
+
+    // float * src1_data = new float[4096 * src1->ne[1]];
+    // float * dst_data = new float[4096 * dst->ne[1]];
+    // float * deq_data = new float[4096];
+    // cudaMemcpy(src1_data, src1_ddf_i, 4096 * src1->ne[1] * sizeof(float), cudaMemcpyDeviceToHost);
+    // cudaMemcpy(dst_data, dst_dd_i, 4096 * dst->ne[1] * sizeof(float), cudaMemcpyDeviceToHost);
+    // cudaMemcpy(deq_data, deq, 4096 * sizeof(float), cudaMemcpyDeviceToHost);
+    // cudaDeviceSynchronize();
+    // print_data_to_file<GGML_TYPE_F32>("fusion1.txt", src1->name, (char const *)src1_data, 4096 * src1->ne[1]);
+    // print_data_to_file<GGML_TYPE_F32>("fusion1.txt", dst->name, (char const *)dst_data, 4096 * src1->ne[1]);
+    // print_data_to_file<GGML_TYPE_F32>("fusion1.txt", "deq_src0", (char const *)deq_data, 4096);
+    // exit(0);
 
     (void) dst;
     (void) src1_ddq_i;
@@ -8569,6 +8765,26 @@ static void ggml_cuda_op_mul_mat(
         }
     }
 
+    // cudaDeviceSynchronize();
+    // float * deq{nullptr};
+    // cudaMalloc(&deq, 4096 * sizeof(float));
+    // cudaMemsetAsync(deq, 0, 4096 * sizeof(float), g_cudaStreams[0][0]);
+    // dequantize_row_q4_0_cuda(src0_dd[0], deq, 4096, g_cudaStreams[0][0]);
+
+    // cudaStreamSynchronize(g_cudaStreams[0][0]);
+    // float * src1_data = new float[4096 * src1->ne[1]];
+    // float * dst_data = new float[4096 * dst->ne[1]];
+    // float * deq_data = new float[4096];
+    // cudaMemcpy(src1_data, src1_ddf[0], 4096 * src1->ne[1] * sizeof(float), cudaMemcpyDeviceToHost);
+    // cudaMemcpy(dst_data, dst_dd[0], 4096 * dst->ne[1] * sizeof(float), cudaMemcpyDeviceToHost);
+    // cudaMemcpy(deq_data, deq, 4096 * sizeof(float), cudaMemcpyDeviceToHost);
+    // cudaDeviceSynchronize();
+    // print_data_to_file<GGML_TYPE_F32>("fusion1.txt", src1->name, (char const *)src1_data, 4096 * src1->ne[1]);
+    // print_data_to_file<GGML_TYPE_F32>("fusion1.txt", dst->name, (char const *)dst_data, 4096 * src1->ne[1]);
+    // print_data_to_file<GGML_TYPE_F32>("fusion1.txt", "deq_src0", (char const *)deq_data, 4096);
+    // exit(0);
+
+
     for (int64_t id = 0; id < g_device_count; ++id) {
         if ((!split && id != g_main_device) || row_low[id] == row_high[id]) {
             continue;
@@ -8971,8 +9187,9 @@ static void ggml_cuda_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1
                 use_mul_mat_q = false;
             }
 
-            if (use_mul_mat_q) {
-                ggml_cuda_op_mul_mat(src0, src1, dst, ggml_cuda_op_mul_mat_q, true);
+            if (!use_mul_mat_q) {
+                // ggml_cuda_op_mul_mat(src0, src1, dst, ggml_cuda_op_mul_mat_q, true);
+                ggml_cuda_op_mul_mat(src0, src1, dst, ggml_cuda_op_mul_mat_cublas, false);
             } else {
                 ggml_cuda_op_mul_mat(src0, src1, dst, ggml_cuda_op_mul_mat_cublas, false);
             }
@@ -9021,8 +9238,8 @@ void ggml_cuda_compute_ffn_fusion(ggml_tensor * dst) {
     void const * down_data = static_cast<void const *>(down_extra->data_device[0]);
     float * dst_data = static_cast<float *>(dst_extra->data_device[0]);
 
-    const float * sparse_idx_data = static_cast<float const *>(ggml_cuda_get_tensor_data(sparse_idx));
-    const int * gpu_bucket_data = Full_offload ? nullptr : static_cast<int const *>(ggml_cuda_get_tensor_data(gpu_bucket));
+    float const * sparse_idx_data = static_cast<float const *>(ggml_cuda_get_tensor_data(sparse_idx));
+    int const * gpu_bucket_data = Full_offload ? nullptr : static_cast<int const *>(ggml_cuda_get_tensor_data(gpu_bucket));
 
     int const n_rows = up->ne[1];
     int const n_cols = up->ne[0];
@@ -9030,20 +9247,76 @@ void ggml_cuda_compute_ffn_fusion(ggml_tensor * dst) {
 
     constexpr int stream_id = 0, stream_is = 0;
     cudaStream_t const stream = g_cudaStreams[stream_id][stream_is];
-
-
     cudaMemsetAsync((void *)dst_data, 0, ggml_nbytes(dst), stream);
+
+    // float * cur_val = new float[4096 * cur->ne[1]];
+    // float * dst_val = new float[4096 * dst->ne[1]];
+    // half * gate_wei = new half[4096];
+    // half * up_wei = new half[4096];
+    // float * sparse_data = new float[11008];
+    // float * tmp_up = new float[11008 * cur->ne[1]];
+    // float * tmp_gate = new float[11008 * cur->ne[1]];
+    // float * tmp_up_gpu{nullptr}, * tmp_gate_gpu{nullptr};
+    // cudaMalloc(&tmp_up_gpu, 11008 * cur->ne[1] * sizeof(float));
+    // cudaMalloc(&tmp_gate_gpu, 11008 * cur->ne[1] * sizeof(float));
+    // cudaMemsetAsync((void *)tmp_up_gpu, 0, 11008 * cur->ne[1] * sizeof(float), stream);
+    // cudaMemsetAsync((void *)tmp_gate_gpu, 0, 11008 * cur->ne[1] * sizeof(float), stream);
+
+    int const block_num_y = (n_rows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+    dim3 const block_dim(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+    dim3 const grid_dim(1, block_num_y, 1);
     if (input_rows == 1) {
-            int const block_num_y = (n_rows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
-            dim3 const block_dim(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-            dim3 const grid_dim(1, block_num_y, 1);
-            ffn_all_gpu_vec<Up_relu, T_type, dequantize_kernel, Full_offload><<<grid_dim, block_dim, 0, stream>>>(
-                cur_data, n_rows, n_cols, up_data, gate_data, down_data, sparse_idx_data, gpu_bucket_data, dst_data
-                    // , up_val_d, gate_val_d
-            );
+        ffn_all_gpu_vec<Up_relu, T_type, dequantize_kernel, Full_offload><<<grid_dim, block_dim, 0, stream>>>(
+            cur_data, n_rows, n_cols, up_data, gate_data, down_data, sparse_idx_data, gpu_bucket_data, dst_data
+                //, tmp_up_gpu, tmp_gate_gpu
+        );
     } else {
-        
+        ffn_all_gpu_batch<Up_relu, T_type, dequantize_kernel, Full_offload><<<grid_dim, block_dim, 0, stream>>>(
+            cur_data, n_rows, n_cols, input_rows, sparse_idx->nb[1], dst->ne[0], 
+                up_data, gate_data, down_data, sparse_idx_data, gpu_bucket_data, dst_data
+                // , tmp_up_gpu, tmp_gate_gpu
+        );
     }
+
+    // ! DEBUG 1. cur 2. up gate 3. middle res 4, axpy
+    // if (cur->ne[1] == 1) {   
+    //     cudaDeviceSynchronize();
+    //     cudaStreamSynchronize(stream);
+    //     cudaMemcpy(cur_val, cur_data, 4096 * cur->ne[1] * sizeof(float), cudaMemcpyDeviceToHost);
+    //     cudaMemcpy(gate_wei, gate_data, 4096 * sizeof(half), cudaMemcpyDeviceToHost);
+    //     cudaMemcpy(up_wei, up_data, 4096 * sizeof(half), cudaMemcpyDeviceToHost);
+    //     cudaMemcpy(tmp_gate, tmp_gate_gpu, 11008 * cur->ne[1] * sizeof(float), cudaMemcpyDeviceToHost);
+    //     cudaMemcpy(dst_val, dst_data, 4096 * dst->ne[1] * sizeof(float), cudaMemcpyDeviceToHost);
+    //     cudaMemcpy(sparse_data, sparse_idx_data, 11008 * sizeof(float), cudaMemcpyDeviceToHost);
+    //     cudaDeviceSynchronize();
+
+    //     {
+    //         int nums0{0}, nums1{0}, nums2{0}, nums3{0};
+    //         for (auto i{0}; i < 11008; ++i) {
+    //             if(sparse_data[i] < 0.0f) {
+    //                 ++nums0;
+    //             }
+    //             if(sparse_data[i] < 1.0f) {
+    //                 ++nums1;
+    //             }
+    //             if(sparse_data[i] < 2.0f) {
+    //                 ++nums2;
+    //             }
+    //             if(sparse_data[i] < 3.0f) {
+    //                 ++nums3;
+    //             }
+    //         }
+    //         float rate0{(float)nums0 / (float)11008}, rate1{(float)nums1 / (float)11008}, rate2{(float)nums2 / (float)11008}, rate3{(float)nums3 / (float)11008};
+    //         printf("sparse rate is %f, %f, %f, %f\n", rate0, rate1, rate2, rate3);
+    //     }
+    //     printf("here\n");
+    //     print_data_to_file<GGML_TYPE_F32>("fusion.txt", cur->name, (char const *)cur_val, 4096 * cur->ne[1]);
+    //     print_data_to_file<GGML_TYPE_F16>("fusion.txt", gate->name, (char const *)gate_wei, 4096);
+    //     print_data_to_file<GGML_TYPE_F16>("fusion.txt", up->name, (char const *)up_wei, 4096);
+    //     print_data_to_file<GGML_TYPE_F32>("fusion.txt", "tmp_gate", (char const *)tmp_gate, 11008 * cur->ne[1]);
+    //     print_data_to_file<GGML_TYPE_F32>("fusion.txt", dst->name, (char const *)dst_val, 4096 * dst->ne[1]);
+    //     exit(0);
+    // }
 }
 
 static void ggml_cuda_ffn_fusion(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {

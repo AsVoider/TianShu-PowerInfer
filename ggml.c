@@ -7328,11 +7328,50 @@ static void ggml_compute_forward_add_q_f32(
     }
 }
 
+static void print_nquant_to_file(char const *file_name, char const *tensor_name, char *data, size_t step, size_t num) {
+    FILE *file = fopen(file_name, "a+");
+    fprintf(file, "%s ", tensor_name);
+    if (step == 2) {
+        // GGML_ASSERT((num == 4096 || num == 11008)&& "num not equal 4096");
+        float *num_to_print = (float *)malloc(num * sizeof(float));
+        ggml_fp16_to_fp32_row((ggml_fp16_t const *)data, num_to_print, num);
+        for (size_t i = 0; i < num; ++i) {
+            fprintf(file, "%f ", num_to_print[i]);
+        }
+        fprintf(file, "\n\n");
+    } else if (step == 4) {
+        for (size_t i = 0; i < num; ++i) {
+            float *f_data = (float *)data;
+            fprintf(file, "%f ", f_data[i]);
+        }
+        fprintf(file, "\n\n");
+    } else {
+        GGML_ASSERT(false && "wrong step");
+    }
+    fclose(file);
+}
+
+static void print_shape(struct ggml_tensor * tensor) {
+    int64_t * ne_ptr = tensor->ne;
+    size_t * nb_ptr = tensor->nb;
+    printf("%s : %ld, %ld, %ld, %ld; %ld, %ld, %ld, %ld, %d, %d\n", tensor->name, 
+        ne_ptr[0], ne_ptr[1], ne_ptr[2], ne_ptr[3], 
+        nb_ptr[0], nb_ptr[1], nb_ptr[2], nb_ptr[3], tensor->backend, tensor->type);
+}
+
 static void ggml_compute_forward_add(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * src0,
         const struct ggml_tensor * src1,
         struct ggml_tensor * dst) {
+    // ! Debug
+    // printf("src0 : %s, src1 : %s\n", src0->name, src1->name);
+    // print_shape(src0);
+    // print_shape(src1);
+    // if (src0->ne[0] == 4096) {
+    //     print_nquant_to_file("simple.txt", src0->name, src0->data, 4, 4096 * src0->ne[1]);
+    // }
+    // exit(0);
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
@@ -7368,6 +7407,13 @@ static void ggml_compute_forward_add(
                 GGML_ASSERT(false);
             } break;
     }
+
+    // if (src0->ne[1] == 1 && strcmp(dst->name, "l_out-31") == 0) {
+    //     print_nquant_to_file("out.txt", src0->name, (char *)src0->data, 4, 4096 * src0->ne[1]);
+    //     print_nquant_to_file("out.txt", src1->name, (char *)src1->data, 4, 4096 * src1->ne[1]);
+    //     print_nquant_to_file("out.txt", dst->name, (char *)dst->data, 4, 4096 * dst->ne[1]);
+    //     exit(0);
+    // }
 }
 
 // ggml_compute_forward_add1
@@ -9354,6 +9400,9 @@ static void ggml_compute_forward_rms_norm_f32(
             }
         }
     }
+
+    // print_nquant_to_file("simple.txt", dst->name, (char *)dst->data, 4, 4096 * src0->ne[1]);
+    // exit(0);
 }
 
 static void ggml_compute_forward_rms_norm(
@@ -9370,6 +9419,12 @@ static void ggml_compute_forward_rms_norm(
                 GGML_ASSERT(false);
             } break;
     }
+    // printf("%s\n", dst->name);
+    // if (src0->ne[1] == 1 && strcmp(dst->name, "norm") == 0) {
+    //     print_nquant_to_file("simple.txt", src0->name, (char *)src0->data, 4, 4096 * src0->ne[1]);
+    //     print_nquant_to_file("simple.txt", dst->name, (char *)dst->data, 4, 4096 * dst->ne[1]);
+    //     exit(0);
+    // }
 }
 
 static void ggml_compute_forward_rms_norm_back_f32(
@@ -9877,6 +9932,16 @@ static void ggml_compute_forward_mul_mat(
             }
         }
     }
+    
+    // if (src1->ne[1] == 1) {
+    //     float src0_data[4096];
+    //     dequantize_row_q4_0(src0->data, src0_data, 4096);
+
+    //     print_nquant_to_file("simple.txt", src1->name, (char *)src1->data, 4, 4096 * src1->ne[1]);
+    //     print_nquant_to_file("simple.txt", dst->name, (char *)dst->data, 4, 4096 * dst->ne[1]);
+    //     print_nquant_to_file("simple.txt", "deq_src0", (char *)src0_data, 4, 4096);
+    //     exit(0);
+    // }
 }
 
 // ggml_compute_forward_out_prod
@@ -14100,29 +14165,6 @@ static void ggml_compute_forward_mul_mat_sparse_head(
 
 }
 
-static void print_nquant_to_file(char const *file_name, char const *tensor_name, char *data, size_t step, size_t num) {
-    FILE *file = fopen(file_name, "a+");
-    fprintf(file, "%s ", tensor_name);
-    if (step == 2) {
-        GGML_ASSERT((num == 4096 || num == 11008)&& "num not equal 4096");
-        float num_to_print[11008] = {0.0f};
-        ggml_fp16_to_fp32_row((ggml_fp16_t const *)data, num_to_print, num);
-        for (size_t i = 0; i < num; ++i) {
-            fprintf(file, "%f ", num_to_print[i]);
-        }
-        fprintf(file, "\n\n");
-    } else if (step == 4) {
-        for (size_t i = 0; i < num; ++i) {
-            float *f_data = (float *)data;
-            fprintf(file, "%f ", f_data[i]);
-        }
-        fprintf(file, "\n\n");
-    } else {
-        GGML_ASSERT(false && "wrong step");
-    }
-    fclose(file);
-}
-
 static void ggml_compute_forward_mul_mat_sparse(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * src0,
@@ -14292,6 +14334,15 @@ static void ggml_compute_forward_mul_mat_sparse(
     //     sched_yield();
     //     return;
     // }
+    // ! Debug
+    // {
+    //     if (src1->ne[1] == 3) {
+    //         printf("src1 is %d\n", src1->type);
+    //         print_nquant_to_file("out.txt", src1->name, (char *)src1->data, 4, 4096 * 3);
+    //         print_nquant_to_file("tmp.txt", src0->name, (char *)src0->data, 2, 4096);
+    //         exit(0);
+    //     }
+    // }
 
     assert(ne12 % ne02 == 0);
     assert(ne13 % ne03 == 0);
@@ -14375,6 +14426,12 @@ static void ggml_compute_forward_mul_mat_sparse(
     // }
     // if (ith == 0)
     //     printf("predictor %d predictor_cpu %d\n", predictor, predictor_cpu);
+    // ! Debug
+    // {
+    //     print_nquant_to_file("tmp.txt", dst->name, (char *)dst->data, 4, 11008 * 3);
+    //     exit(0);
+    // }
+
 }
 
 atomic_flag g_ffn_sparse = ATOMIC_FLAG_INIT;
@@ -14561,6 +14618,7 @@ static void ggml_compute_forward_ffn_fusion_part(
     //         print_nquant_to_file("tmp.txt", cur->name, cur->data, 4, 4096);
     //         print_nquant_to_file("tmp.txt", "wdata__", wdata, 4, 4096);
     //         print_nquant_to_file("tmp.txt", gate->name, gate->data, 2, 4096); 
+    //         exit(0);
     //     }
     // }
     const size_t row_size = cur_ne0*ggml_type_size(vec_dot_type)/ggml_blck_size(vec_dot_type);
@@ -14594,6 +14652,10 @@ static void ggml_compute_forward_ffn_fusion_part(
     int *gid = (int *)gpu_index->data;
     float *predictor_data = (float *)sparse_idx->data;
     const size_t predictor_row_size = sparse_idx->ne[0]*ggml_type_size(GGML_TYPE_F32)/ggml_blck_size(GGML_TYPE_F32);
+
+    // ! Debug
+    // float * gate_tmp = (float *)malloc(11008 * cur->ne[1] * sizeof(float));
+    // memset(gate_tmp, 0, 11008 * cur->ne[1] * sizeof(float));
 
     while(true) {
         ir010 = atomic_fetch_add(params->aic, dr0);
@@ -14660,14 +14722,15 @@ static void ggml_compute_forward_ffn_fusion_part(
         
     }
     // ! Debug
-    {   
-        // printf("here\n");
-        // if (dst->ne[1] == 1) {
-        //     print_nquant_to_file("tmp.txt", "gate_tmp", gate_tmp, 4, 11008);
-        //     print_nquant_to_file("tmp.txt", "up_tmp", up_tmp, 4, 11008);
-        //     exit(0);
-        // }
-    }
+    // {   
+    //     printf("here\n");
+    //     if (dst->ne[1] == 1) {
+    //         print_nquant_to_file("tmp.txt", cur->name, cur->data, 4, 4096);
+    //         print_nquant_to_file("tmp.txt", "gate_tmp", gate_tmp, 4, 11008);
+    //         print_nquant_to_file("tmp.txt", "up_tmp", up_tmp, 4, 11008);
+    //         exit(0);
+    //     }
+    // }
 }
 
 // vz = alpha * vx + vy  
@@ -15019,6 +15082,14 @@ static void ggml_compute_forward_mul_mat_axpy_q4_0(
 #if defined(_MSC_VER)
     _freea(vec);
 #endif
+    
+    // ! Debug
+    // {
+    //     if (src1->ne[1] == 1) {
+    //         print_nquant_to_file("tmp.txt", dst->name, dst->data, 4, 4096);
+    //         exit(0);
+    //     }
+    // }
 }
 atomic_flag g_axpy_head_lock = ATOMIC_FLAG_INIT;
 static void ggml_compute_forward_mul_mat_axpy_head(
@@ -17138,7 +17209,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                     // Fully offloaded to GPU
                     n_tasks = 1;
                 } else {
-                    GGML_ASSERT(n_threads > 1 && "n_threads must be > 1 to enable hybrid CPU/GPU computation");
+                    // GGML_ASSERT(n_threads > 1 && "n_threads must be > 1 to enable hybrid CPU/GPU computation");
                 }
 #endif
             } break;
