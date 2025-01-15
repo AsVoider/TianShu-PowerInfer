@@ -2513,6 +2513,7 @@ void ggml_axpy_fp16_fp32(int n, const void * GGML_RESTRICT vx, const void * vy, 
     const float *      y = (const float *)vy;
           float *      z = (float *)vz;
 
+#ifdef __AVX2__
     const int step  = 32;
     const int np    = (n & ~(step - 1));
     __m256 scale_vec = _mm256_set1_ps(scale);
@@ -2532,9 +2533,30 @@ void ggml_axpy_fp16_fp32(int n, const void * GGML_RESTRICT vx, const void * vy, 
     for (int i = np; i < n; ++i) {
         z[i] = GGML_FP16_TO_FP32(x[i]) * scale + y[i];
     }    
+#elif defined(__ARM_NEON)
+    int const step = 16;
+    int const np = (n & ~(step - 1));
+    float32x4_t sclae_vec = vdupq_n_f32(scale);
+
+    for (int i = 0; i < np; i += step) {
+        for (int j = 0; j < 4; ++j) {
+            float16x4_t x_half = vld1_f16((float16_t const *)(x + i + j * 4));
+            float32x4_t ax = vcvt_f32_f16(x_half);
+            float32x4_t ay = vld1q_f32(y + i + j * 4);
+            float32x4_t res = vmlaq_f32(ay, ax, sclae_vec);
+            vst1q_f32(z + i + j * 4, res);
+        }
+    }
+
+    for (int i = np; i < n; ++i) {
+        z[i] = GGML_FP16_TO_FP32(x[i]) * scale + y[i];
+    }
+#endif
 }
 
 void ggml_axpy_store_fp32(int n, float const * GGML_RESTRICT vx, float * GGML_RESTRICT vy, float scale) {
+    
+#if defined(__AVX2__)
     if (scale == 1) {
         int i = 0;
         for (; i + 8 < n; i += 8) {
@@ -2555,6 +2577,28 @@ void ggml_axpy_store_fp32(int n, float const * GGML_RESTRICT vx, float * GGML_RE
         }
         for (; i < n; ++i) { vy[i] += vx[i] * scale; }
     }
+#elif defined(__ARM_NEON)
+    if (scale == 1.0f) {
+        int i = 0;
+        for (; i + 4 < n; i += 4) {
+            float32x4_t const a = vld1q_f32(vy + i);
+            float32x4_t const b = vld1q_f32(vx + i);
+            float32x4_t const res = vaddq_f32(a, b);
+            vst1q_f32(vy + i, res);
+        }
+        for (; i < n; ++i) { vy[i] += vx[i]; }
+    } else {
+        int i = 0;
+        float32x4_t const v_scale = vdupq_n_f32(scale);
+        for (; i + 4 < n; i += 4) {
+            float32x4_t const a = vld1q_f32(vy + i);
+            float32x4_t const b = vld1q_f32(vx + i);
+            float32x4_t const res = vmlaq_f32(a, b, v_scale);
+            vst1q_f32(vy + i, res);
+        }
+        for (; i < n; ++i) { vy[i] += vx[i] * scale; }
+    }
+#endif
 }
 
 void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, const void * restrict vx, const void * restrict vy) {
